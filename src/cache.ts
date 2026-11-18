@@ -4,7 +4,13 @@ export class ByteCache<K, V> {
 
   private limit: number;
   constructor(limit: number) { this.limit = limit; }
-  get(key: K): V | undefined { return this.entries.get(key)?.value; }
+  get(key: K): V | undefined {
+    const entry = this.entries.get(key);
+    if (!entry) return undefined;
+    this.entries.delete(key);
+    this.entries.set(key, entry);
+    return entry.value;
+  }
   keys() { return this.entries.keys(); }
   delete(key: K) {
     const entry = this.entries.get(key);

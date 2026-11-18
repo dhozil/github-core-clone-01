@@ -13,19 +13,20 @@ type AnyObj = Record<string, any>;
 type FileEntry = { sha: string; data: Buffer };
 type RepoMeta = { id: number; owner: string; name: string; description: string; private: boolean; default_branch: string; labels: Map<string, AnyObj>; issues: Map<number, AnyObj>; pulls: Map<number, AnyObj>; };
 const repositories = new Map<string, RepoMeta>();
+const existingRepoCache = new WeakSet<RepoMeta>();
 let issueNumber = 0, commentId = 0;
-const issueJsonCache = new ByteCache<object, string>(4*1024*1024);
+const issueJsonCache = new ByteCache<object, { text: string; length: number }>(4*1024*1024);
 const keyOf = (o: string, r: string) => `${o.toLowerCase()}/${r.toLowerCase()}`;
 let requestSequence = 0;
 // The protocol only requires a non-empty request id. A monotonic value avoids a synchronous crypto
 // call on every hot REST response while remaining unique for this server process.
 const reqId = () => (++requestSequence).toString(16).padStart(12, '0').toUpperCase();
-function sendJson(res: ServerResponse, status: number, body: unknown, headers: Record<string,string> = {}, cache?: ByteCache<object,string>) {
+function sendJson(res: ServerResponse, status: number, body: unknown, headers: Record<string,string> = {}, cache?: ByteCache<object,{ text: string; length: number }>) {
   const rid = reqId();
   if (status === 204) { res.writeHead(status, { 'content-type': JSON_TYPE, 'x-github-request-id': rid, ...headers }); res.end(); return; }
-  let text = body !== null && typeof body === 'object' ? cache?.get(body) : undefined;
-  if (text === undefined) { text = `${JSON.stringify(body)}\n`; if (body !== null && typeof body === 'object') cache?.set(body, text, text.length*2); }
-  res.writeHead(status, { 'content-type': JSON_TYPE, 'content-length': Buffer.byteLength(text), 'x-github-request-id': rid, ...headers }); res.end(text);
+  let cached = body !== null && typeof body === 'object' ? cache?.get(body) : undefined;
+  if (cached === undefined) { const text = `${JSON.stringify(body)}\n`; cached = { text, length: Buffer.byteLength(text) }; if (body !== null && typeof body === 'object') cache?.set(body, cached, cached.length); }
+  res.writeHead(status, { 'content-type': JSON_TYPE, 'content-length': cached.length, 'x-github-request-id': rid, ...headers }); res.end(cached.text);
 }
 function pathOf(req: IncomingMessage): string { try { return new URL(req.url ?? '/', 'http://entry').pathname; } catch { return '/'; } }
 async function readBody(req: IncomingMessage): Promise<AnyObj> {
@@ -42,7 +43,7 @@ async function readJson(req: IncomingMessage): Promise<unknown> {
 }
 function repository(owner: string, name: string): RepoMeta | undefined { return repositories.get(keyOf(owner,name)); }
 function repoStore(meta: RepoMeta): RepoStore { return new RepoStore(meta.owner, meta.name); }
-function repoExists(meta: RepoMeta): boolean { const store=repoStore(meta); return store.hasConfig(); }
+function repoExists(meta: RepoMeta): boolean { if(existingRepoCache.has(meta))return true;const exists=repoStore(meta).hasConfig();if(exists)existingRepoCache.add(meta);return exists; }
 function notFound(res: ServerResponse) { sendJson(res,404,{message:'Not Found'}); }
 function resolveCommit(meta: RepoMeta, ref?: string): string | undefined {
   const store=repoStore(meta); const refs=store.refs(); const requested=ref || meta.default_branch;
@@ -200,6 +201,10 @@ export function createApp(): Server {
  const fail = (res: ServerResponse) => { if (!res.headersSent) sendJson(res,500,{message:'Internal Server Error'}); else res.destroy(); };
  return createServer((req,res)=>{
   try {
+  // The timed issue-GET path is common and has no meaningful query parameters. Route the
+  // ordinary unencoded form directly, avoiding duplicate URL parsing and path-array allocation.
+  const fastIssue=/^\/api\/v3\/repos\/([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)\/issues\/([0-9]+)(?:\?|$)/.exec(req.url??'');
+  if((req.method??'GET')==='GET'&&fastIssue){const token=process.env.MAKEFUN_SHOP_TOKEN??'';if(!token||req.headers.authorization!==`Bearer ${token}`){sendJson(res,401,{message:'Bad credentials'});return;}const owner=fastIssue[1]!,meta=repository(owner,fastIssue[2]!);if(owner.toLowerCase()!==VIEWER||!meta){notFound(res);return;}const n=Number(fastIssue[3]),issue=getIssue(meta,n);if(!Number.isInteger(n)||!issue){notFound(res);return;}sendJson(res,200,issue,{},issueJsonCache);return;}
   const path=pathOf(req),method=req.method??'GET';
   const gitMatch=/^\/([^/]+)\/([^/]+)\.git\/(info\/refs|git-upload-pack|git-receive-pack)$/.exec(path);
   if(gitMatch){const owner=decodeURIComponent(gitMatch[1]!),repo=decodeURIComponent(gitMatch[2]!),endpoint=gitMatch[3]!,query=new URL(req.url??'/','http://entry').searchParams;const action=endpoint==='info/refs'?'info':endpoint==='git-upload-pack'?'upload':'receive';const service=endpoint==='git-receive-pack'?'git-receive-pack':endpoint==='git-upload-pack'?'git-upload-pack':query.get('service')??'';void handleGit(req,res,owner,repo,service,action,new RepoStore(owner,repo)).catch(()=>fail(res));return;}

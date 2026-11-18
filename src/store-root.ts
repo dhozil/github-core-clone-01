@@ -1,4 +1,5 @@
 import { cpSync, mkdtempSync, realpathSync } from 'node:fs';
+import { cp } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { isAbsolute, join, relative, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -48,6 +49,20 @@ export function storeOperation<T>(operation: () => T): T {
     const next = createRoot(tmpdir());
     // Keep the original store selected unless its contents were copied successfully.
     cpSync(active, next, { recursive: true });
+    active = next;
+    fallback = true;
+    return operation();
+  }
+}
+
+export async function storeOperationAsync<T>(operation: () => Promise<T>): Promise<T> {
+  try { return await operation(); }
+  catch (error) {
+    const failure = error as NodeJS.ErrnoException;
+    if (!active || fallback || !['EACCES', 'EROFS', 'EPERM'].includes(failure.code ?? '')) throw error;
+    logFallback(error);
+    const next = createRoot(tmpdir());
+    await cp(active, next, { recursive: true });
     active = next;
     fallback = true;
     return operation();
