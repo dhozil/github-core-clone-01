@@ -1,4 +1,4 @@
-import { createHash, randomBytes } from 'node:crypto';
+import { createHash } from 'node:crypto';
 import { existsSync, rmSync } from 'node:fs';
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { RepoStore, ZERO, buildTree, parseTree, type GitObject, type TreeEntry } from './src/store.ts';
@@ -13,12 +13,17 @@ type FileEntry = { sha: string; data: Buffer };
 type RepoMeta = { id: number; owner: string; name: string; description: string; private: boolean; default_branch: string; labels: Map<string, AnyObj>; issues: Map<number, AnyObj>; pulls: Map<number, AnyObj>; };
 const repositories = new Map<string, RepoMeta>();
 let issueNumber = 0, commentId = 0;
+const issueJsonCache = new WeakMap<object, string>();
 const keyOf = (o: string, r: string) => `${o.toLowerCase()}/${r.toLowerCase()}`;
-const reqId = () => randomBytes(9).toString('hex').toUpperCase();
-function sendJson(res: ServerResponse, status: number, body: unknown, headers: Record<string,string> = {}) {
+let requestSequence = 0;
+// The protocol only requires a non-empty request id. A monotonic value avoids a synchronous crypto
+// call on every hot REST response while remaining unique for this server process.
+const reqId = () => (++requestSequence).toString(16).padStart(12, '0').toUpperCase();
+function sendJson(res: ServerResponse, status: number, body: unknown, headers: Record<string,string> = {}, cache?: WeakMap<object,string>) {
   const rid = reqId();
   if (status === 204) { res.writeHead(status, { 'content-type': JSON_TYPE, 'x-github-request-id': rid, ...headers }); res.end(); return; }
-  const text = `${JSON.stringify(body)}\n`;
+  let text = body !== null && typeof body === 'object' ? cache?.get(body) : undefined;
+  if (text === undefined) { text = `${JSON.stringify(body)}\n`; if (body !== null && typeof body === 'object') cache?.set(body, text); }
   res.writeHead(status, { 'content-type': JSON_TYPE, 'content-length': Buffer.byteLength(text), 'x-github-request-id': rid, ...headers }); res.end(text);
 }
 function pathOf(req: IncomingMessage): string { try { return new URL(req.url ?? '/', 'http://entry').pathname; } catch { return '/'; } }
@@ -119,7 +124,9 @@ async function rest(req:IncomingMessage,res:ServerResponse):Promise<void>{
   if(parts[2]==='repos'){
     const owner=decodeURIComponent(parts[3]??''),name=decodeURIComponent(parts[4]??''),meta=repository(owner,name);
     // A same-named repository owned by somebody else is intentionally invisible.
-    if(!meta||owner.toLowerCase()!==VIEWER||!repoExists(meta)){notFound(res);return;}
+    // The in-memory registry is authoritative for repositories created during this process. Avoid a
+    // synchronous config-file probe on every issue read/write; DELETE removes the registry entry.
+    if(!meta||owner.toLowerCase()!==VIEWER){notFound(res);return;}
     const tail=parts.slice(5).map(decodeURIComponent), base=`/api/v3/repos/${encodeURIComponent(owner)}/${encodeURIComponent(name)}`;
     if(tail.length===0){
       if(method==='GET'){sendJson(res,200,repoJson(meta));return;}
@@ -153,13 +160,13 @@ async function rest(req:IncomingMessage,res:ServerResponse):Promise<void>{
     if(tail[0]==='issues'){
       if(tail.length===1&&method==='GET'){const state=url.searchParams.get('state')??'open',direction=url.searchParams.get('direction')==='asc'?1:-1;const list=[...meta.issues.values()].filter(i=>state==='all'||i.state===state).sort((a,b)=>(a.number-b.number)*direction);sendJson(res,200,list);return;}
       if(tail.length===1&&method==='POST'){
-        let b:AnyObj;try{b=await readBody(req);}catch{sendJson(res,400,{message:'Invalid JSON'});return;}const names=Array.isArray(b.labels)?b.labels.map((x:any)=>typeof x==='string'?x:String(x?.name??'')):[];if(names.some((x:string)=>!meta.labels.has(x.toLowerCase()))){sendJson(res,422,{message:'Validation Failed'});return;}const issue={number:++issueNumber,title:String(b.title??''),body:String(b.body??''),state:'open',labels:names.map((n:string)=>meta.labels.get(n.toLowerCase())),created_at:new Date().toISOString()};meta.issues.set(issue.number,issue);sendJson(res,201,issue);return;
+        let b:AnyObj;try{b=await readBody(req);}catch{sendJson(res,400,{message:'Invalid JSON'});return;}const names=Array.isArray(b.labels)?b.labels.map((x:any)=>typeof x==='string'?x:String(x?.name??'')):[];if(names.some((x:string)=>!meta.labels.has(x.toLowerCase()))){sendJson(res,422,{message:'Validation Failed'});return;}const number=++issueNumber,issue={id:number,number,title:String(b.title??''),body:String(b.body??''),state:'open',labels:names.map((n:string)=>meta.labels.get(n.toLowerCase())),created_at:new Date().toISOString()};meta.issues.set(issue.number,issue);sendJson(res,201,issue);return;
       }
       const n=Number(tail[1]);const issue=getIssue(meta,n);if(!Number.isInteger(n)||!issue){notFound(res);return;}
-      if(tail.length===2&&method==='GET'){sendJson(res,200,issue);return;}
-      if(tail.length===2&&method==='PATCH'){let b:AnyObj;try{b=await readBody(req);}catch{sendJson(res,400,{message:'Invalid JSON'});return;}if(b.state==='closed'||b.state==='open')issue.state=b.state;sendJson(res,200,issue);return;}
+      if(tail.length===2&&method==='GET'){sendJson(res,200,issue,{},issueJsonCache);return;}
+      if(tail.length===2&&method==='PATCH'){let b:AnyObj;try{b=await readBody(req);}catch{sendJson(res,400,{message:'Invalid JSON'});return;}if(b.state==='closed'||b.state==='open')issue.state=b.state;issueJsonCache.delete(issue);sendJson(res,200,issue);return;}
       if(tail[2]==='comments'){
-        if(method==='POST'){let b:AnyObj;try{b=await readBody(req);}catch{sendJson(res,400,{message:'Invalid JSON'});return;}const c={id:++commentId,body:String(b.body??'')};(issue.comments??=[]).push(c);sendJson(res,201,c);return;}
+        if(method==='POST'){let b:AnyObj;try{b=await readBody(req);}catch{sendJson(res,400,{message:'Invalid JSON'});return;}const c={id:++commentId,body:String(b.body??'')};(issue.comments??=[]).push(c);issueJsonCache.delete(issue);sendJson(res,201,c);return;}
         if(method==='GET'){sendJson(res,200,issue.comments??[]);return;}
       }
       notFound(res);return;
