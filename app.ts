@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
-import { existsSync, rmSync } from 'node:fs';
+import { ByteCache } from './src/cache.ts';
+import { initializeStore } from './src/store-root.ts';
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { RepoStore, ZERO, buildTree, parseTree, type GitObject, type TreeEntry } from './src/store.ts';
 import { handleGit } from './src/git-http.ts';
@@ -13,17 +14,17 @@ type FileEntry = { sha: string; data: Buffer };
 type RepoMeta = { id: number; owner: string; name: string; description: string; private: boolean; default_branch: string; labels: Map<string, AnyObj>; issues: Map<number, AnyObj>; pulls: Map<number, AnyObj>; };
 const repositories = new Map<string, RepoMeta>();
 let issueNumber = 0, commentId = 0;
-const issueJsonCache = new WeakMap<object, string>();
+const issueJsonCache = new ByteCache<object, string>(4*1024*1024);
 const keyOf = (o: string, r: string) => `${o.toLowerCase()}/${r.toLowerCase()}`;
 let requestSequence = 0;
 // The protocol only requires a non-empty request id. A monotonic value avoids a synchronous crypto
 // call on every hot REST response while remaining unique for this server process.
 const reqId = () => (++requestSequence).toString(16).padStart(12, '0').toUpperCase();
-function sendJson(res: ServerResponse, status: number, body: unknown, headers: Record<string,string> = {}, cache?: WeakMap<object,string>) {
+function sendJson(res: ServerResponse, status: number, body: unknown, headers: Record<string,string> = {}, cache?: ByteCache<object,string>) {
   const rid = reqId();
   if (status === 204) { res.writeHead(status, { 'content-type': JSON_TYPE, 'x-github-request-id': rid, ...headers }); res.end(); return; }
   let text = body !== null && typeof body === 'object' ? cache?.get(body) : undefined;
-  if (text === undefined) { text = `${JSON.stringify(body)}\n`; if (body !== null && typeof body === 'object') cache?.set(body, text); }
+  if (text === undefined) { text = `${JSON.stringify(body)}\n`; if (body !== null && typeof body === 'object') cache?.set(body, text, text.length*2); }
   res.writeHead(status, { 'content-type': JSON_TYPE, 'content-length': Buffer.byteLength(text), 'x-github-request-id': rid, ...headers }); res.end(text);
 }
 function pathOf(req: IncomingMessage): string { try { return new URL(req.url ?? '/', 'http://entry').pathname; } catch { return '/'; } }
@@ -41,7 +42,7 @@ async function readJson(req: IncomingMessage): Promise<unknown> {
 }
 function repository(owner: string, name: string): RepoMeta | undefined { return repositories.get(keyOf(owner,name)); }
 function repoStore(meta: RepoMeta): RepoStore { return new RepoStore(meta.owner, meta.name); }
-function repoExists(meta: RepoMeta): boolean { const store=repoStore(meta); return existsSync(`${store.path}/config`); }
+function repoExists(meta: RepoMeta): boolean { const store=repoStore(meta); return store.hasConfig(); }
 function notFound(res: ServerResponse) { sendJson(res,404,{message:'Not Found'}); }
 function resolveCommit(meta: RepoMeta, ref?: string): string | undefined {
   const store=repoStore(meta); const refs=store.refs(); const requested=ref || meta.default_branch;
@@ -131,7 +132,7 @@ async function rest(req:IncomingMessage,res:ServerResponse):Promise<void>{
     if(tail.length===0){
       if(method==='GET'){sendJson(res,200,repoJson(meta));return;}
       if(method==='PATCH'){let b:AnyObj;try{b=await readBody(req);}catch{sendJson(res,400,{message:'Invalid JSON'});return;}if(typeof b.description==='string')meta.description=b.description;if(typeof b.private==='boolean')meta.private=b.private;sendJson(res,200,repoJson(meta));return;}
-      if(method==='DELETE'){repositories.delete(keyOf(owner,name));const s=repoStore(meta);rmSync(s.path,{recursive:true,force:true});sendJson(res,204,null);return;}
+      if(method==='DELETE'){repoStore(meta).remove();repositories.delete(keyOf(owner,name));sendJson(res,204,null);return;}
     }
     if(tail[0]==='git'&&tail[1]==='refs'&&method==='POST'){
       let b:AnyObj;try{b=await readBody(req);}catch{sendJson(res,400,{message:'Invalid JSON'});return;}const ref=String(b.ref??''),sha=String(b.sha??'');if(!ref.startsWith('refs/heads/')||repoStore(meta).object(sha)?.type!=='commit'){sendJson(res,422,{message:'Invalid ref'});return;}repoStore(meta).setRef(ref,sha);sendJson(res,201,{ref,object:{sha}});return;
@@ -195,14 +196,18 @@ async function rest(req:IncomingMessage,res:ServerResponse):Promise<void>{
 function repoJson(r:RepoMeta){return {id:r.id,name:r.name,full_name:`${r.owner}/${r.name}`,owner:{login:r.owner},private:r.private,default_branch:r.default_branch,description:r.description};}
 
 export function createApp(): Server {
+ initializeStore();
+ const fail = (res: ServerResponse) => { if (!res.headersSent) sendJson(res,500,{message:'Internal Server Error'}); else res.destroy(); };
  return createServer((req,res)=>{
+  try {
   const path=pathOf(req),method=req.method??'GET';
   const gitMatch=/^\/([^/]+)\/([^/]+)\.git\/(info\/refs|git-upload-pack|git-receive-pack)$/.exec(path);
-  if(gitMatch){const owner=decodeURIComponent(gitMatch[1]!),repo=decodeURIComponent(gitMatch[2]!),endpoint=gitMatch[3]!,query=new URL(req.url??'/','http://entry').searchParams;const action=endpoint==='info/refs'?'info':endpoint==='git-upload-pack'?'upload':'receive';const service=endpoint==='git-receive-pack'?'git-receive-pack':endpoint==='git-upload-pack'?'git-upload-pack':query.get('service')??'';void handleGit(req,res,owner,repo,service,action,new RepoStore(owner,repo));return;}
+  if(gitMatch){const owner=decodeURIComponent(gitMatch[1]!),repo=decodeURIComponent(gitMatch[2]!),endpoint=gitMatch[3]!,query=new URL(req.url??'/','http://entry').searchParams;const action=endpoint==='info/refs'?'info':endpoint==='git-upload-pack'?'upload':'receive';const service=endpoint==='git-receive-pack'?'git-receive-pack':endpoint==='git-upload-pack'?'git-upload-pack':query.get('service')??'';void handleGit(req,res,owner,repo,service,action,new RepoStore(owner,repo)).catch(()=>fail(res));return;}
   if(method==='GET'&&path==='/healthz'){sendJson(res,200,{ok:true});return;}
-  if(path==='/mcp'&&method==='POST'){void handleMcp(req,res,{token:process.env.MAKEFUN_SHOP_TOKEN??'',viewer:VIEWER,repo:repository,createRepo:(name)=>{const meta:RepoMeta={id:repositories.size+1,owner:VIEWER,name,description:'',private:true,default_branch:'main',labels:new Map(),issues:new Map(),pulls:new Map()};new RepoStore(VIEWER,name).create();repositories.set(keyOf(VIEWER,name),meta);return repoJson(meta);},nextIssue:()=>++issueNumber,merge:mergePullForGraphQL});return;}
+  if(path==='/mcp'&&method==='POST'){void handleMcp(req,res,{token:process.env.MAKEFUN_SHOP_TOKEN??'',viewer:VIEWER,repo:repository,createRepo:(name)=>{const meta:RepoMeta={id:repositories.size+1,owner:VIEWER,name,description:'',private:true,default_branch:'main',labels:new Map(),issues:new Map(),pulls:new Map()};new RepoStore(VIEWER,name).create();repositories.set(keyOf(VIEWER,name),meta);return repoJson(meta);},nextIssue:()=>++issueNumber,merge:mergePullForGraphQL}).catch(()=>fail(res));return;}
   if(path==='/api/graphql'){void graphql(req,res).catch(()=>{if(!res.headersSent)sendJson(res,500,{message:'Internal Server Error'});});return;}
   if(path==='/api/v3'||path.startsWith('/api/v3/')){void rest(req,res).catch(()=>{if(!res.headersSent)sendJson(res,500,{message:'Internal Server Error'});});return;}
   notFound(res);
+  } catch { fail(res); }
  });
 }
