@@ -4,6 +4,7 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import { RepoStore, ZERO, buildTree, parseTree, type GitObject, type TreeEntry } from './src/store.ts';
 import { handleGit } from './src/git-http.ts';
 import { executeGraphQL } from './src/graphql.ts';
+import { handleMcp } from './src/mcp.ts';
 
 const JSON_TYPE = 'application/json; charset=utf-8';
 const VIEWER = 'adaiversen';
@@ -192,6 +193,7 @@ export function createApp(): Server {
   const gitMatch=/^\/([^/]+)\/([^/]+)\.git\/(info\/refs|git-upload-pack|git-receive-pack)$/.exec(path);
   if(gitMatch){const owner=decodeURIComponent(gitMatch[1]!),repo=decodeURIComponent(gitMatch[2]!),endpoint=gitMatch[3]!,query=new URL(req.url??'/','http://entry').searchParams;const action=endpoint==='info/refs'?'info':endpoint==='git-upload-pack'?'upload':'receive';const service=endpoint==='git-receive-pack'?'git-receive-pack':endpoint==='git-upload-pack'?'git-upload-pack':query.get('service')??'';void handleGit(req,res,owner,repo,service,action,new RepoStore(owner,repo));return;}
   if(method==='GET'&&path==='/healthz'){sendJson(res,200,{ok:true});return;}
+  if(path==='/mcp'&&method==='POST'){void handleMcp(req,res,{token:process.env.MAKEFUN_SHOP_TOKEN??'',viewer:VIEWER,repo:repository,createRepo:(name)=>{const meta:RepoMeta={id:repositories.size+1,owner:VIEWER,name,description:'',private:true,default_branch:'main',labels:new Map(),issues:new Map(),pulls:new Map()};new RepoStore(VIEWER,name).create();repositories.set(keyOf(VIEWER,name),meta);return repoJson(meta);},nextIssue:()=>++issueNumber,merge:mergePullForGraphQL});return;}
   if(path==='/api/graphql'){void graphql(req,res).catch(()=>{if(!res.headersSent)sendJson(res,500,{message:'Internal Server Error'});});return;}
   if(path==='/api/v3'||path.startsWith('/api/v3/')){void rest(req,res).catch(()=>{if(!res.headersSent)sendJson(res,500,{message:'Internal Server Error'});});return;}
   notFound(res);
