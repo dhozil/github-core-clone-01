@@ -3,12 +3,13 @@ import { existsSync, rmSync } from 'node:fs';
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { RepoStore, ZERO, buildTree, parseTree, type GitObject, type TreeEntry } from './src/store.ts';
 import { handleGit } from './src/git-http.ts';
+import { executeGraphQL } from './src/graphql.ts';
 
 const JSON_TYPE = 'application/json; charset=utf-8';
 const VIEWER = 'adaiversen';
 type AnyObj = Record<string, any>;
 type FileEntry = { sha: string; data: Buffer };
-type RepoMeta = { owner: string; name: string; description: string; private: boolean; default_branch: string; labels: Map<string, AnyObj>; issues: Map<number, AnyObj>; pulls: Map<number, AnyObj>; };
+type RepoMeta = { id: number; owner: string; name: string; description: string; private: boolean; default_branch: string; labels: Map<string, AnyObj>; issues: Map<number, AnyObj>; pulls: Map<number, AnyObj>; };
 const repositories = new Map<string, RepoMeta>();
 let issueNumber = 0, commentId = 0;
 const keyOf = (o: string, r: string) => `${o.toLowerCase()}/${r.toLowerCase()}`;
@@ -26,6 +27,11 @@ async function readBody(req: IncomingMessage): Promise<AnyObj> {
   if (!raw) throw new Error('Invalid JSON');
   const value = JSON.parse(raw); if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('Invalid JSON');
   return value;
+}
+async function readJson(req: IncomingMessage): Promise<unknown> {
+  const chunks: Buffer[] = []; for await (const chunk of req) chunks.push(Buffer.from(chunk));
+  const raw = Buffer.concat(chunks).toString('utf8'); if (!raw) throw new Error('Invalid JSON');
+  return JSON.parse(raw) as unknown;
 }
 function repository(owner: string, name: string): RepoMeta | undefined { return repositories.get(keyOf(owner,name)); }
 function repoStore(meta: RepoMeta): RepoStore { return new RepoStore(meta.owner, meta.name); }
@@ -55,6 +61,43 @@ function commitInfo(store:RepoStore, sha:string) {const obj=store.object(sha);if
 function getIssue(meta:RepoMeta,n:number){return meta.issues.get(n);}
 function apiRepo(pathParts:string[]): RepoMeta | undefined { if(pathParts.length<4||pathParts[0]!=='api'||pathParts[1]!=='v3'||pathParts[2]!=='repos')return;const o=decodeURIComponent(pathParts[3]!),n=decodeURIComponent(pathParts[4]??'');const r=repository(o,n);return r&&repoExists(r)?r:undefined; }
 
+function mergePullForGraphQL(meta: RepoMeta, pull: AnyObj): boolean {
+  const currentTip=resolveCommit(meta,pull.base.ref)??pull.base_sha;
+  if(pull.state==='closed')return false;
+  const baseFiles=filesAt(meta,pull.base_sha),currentFiles=filesAt(meta,currentTip),headFiles=filesAt(meta,pull.head_sha);
+  for(const p of new Set([...baseFiles.keys(),...currentFiles.keys(),...headFiles.keys()])){
+    const b=baseFiles.get(p)?.sha,c=currentFiles.get(p)?.sha,h=headFiles.get(p)?.sha;
+    if(c!==b&&h!==b&&c!==h)return false;
+  }
+  const merged=new Map(currentFiles);
+  for(const p of new Set([...baseFiles.keys(),...headFiles.keys()])){
+    const before=baseFiles.get(p),head=headFiles.get(p);if(before?.sha===head?.sha)continue;if(head)merged.set(p,head);else merged.delete(p);
+  }
+  const result=commitTree(meta,merged,`Squash merge pull request #${pull.number}`,pull.base.ref,currentTip);
+  pull.state='closed';pull.merged=true;pull.merged_at=new Date().toISOString();pull.merge_commit_sha=result.commitSha;pull.base.sha=result.commitSha;return true;
+}
+
+async function graphql(req: IncomingMessage, res: ServerResponse): Promise<void> {
+  const token=process.env.MAKEFUN_SHOP_TOKEN??'';
+  if(!token||req.headers.authorization!==`Bearer ${token}`){sendJson(res,401,{message:'Bad credentials'});return;}
+  if((req.method??'GET')!=='POST'){sendJson(res,405,{message:'Method Not Allowed'});return;}
+  let body:unknown;try{body=await readJson(req);}catch{sendJson(res,400,{message:'Invalid JSON'});return;}
+  const result=executeGraphQL(body,{
+    viewer:VIEWER,
+    repositories,
+    repository:(owner,name)=>repository(owner,name),
+    resolveBranch:(meta,ref)=>resolveCommit(meta as RepoMeta,ref),
+    pullFiles:(meta,pull)=>{
+      const m=meta as RepoMeta,before=filesAt(m,pull.base_sha),after=filesAt(m,pull.head_sha);
+      return [...after.keys()].filter(path=>before.get(path)?.sha!==after.get(path)?.sha).concat([...before.keys()].filter(path=>!after.has(path)));
+    },
+    mergePull:(meta,pull)=>mergePullForGraphQL(meta as RepoMeta,pull),
+    nextIssueNumber:()=>++issueNumber,
+    nextCommentId:()=>++commentId,
+  });
+  sendJson(res,200,result);
+}
+
 async function rest(req:IncomingMessage,res:ServerResponse):Promise<void>{
   const url=new URL(req.url??'/', 'http://entry'), path=url.pathname, method=req.method??'GET';
   const parts=path.split('/').filter(Boolean); const token=process.env.MAKEFUN_SHOP_TOKEN??'';
@@ -65,7 +108,7 @@ async function rest(req:IncomingMessage,res:ServerResponse):Promise<void>{
     let b:AnyObj;try{b=await readBody(req);}catch{sendJson(res,400,{message:'Invalid JSON'});return;}
     if(typeof b.name!=='string'||!/^[A-Za-z0-9_.-]+$/.test(b.name)){sendJson(res,422,{message:'Validation Failed'});return;}
     const owner=VIEWER,name=b.name,key=keyOf(owner,name);if(repository(owner,name)){sendJson(res,422,{message:'Repository already exists'});return;}
-    const meta:RepoMeta={owner,name,description:typeof b.description==='string'?b.description:'',private:b.private!==false,default_branch:typeof b.default_branch==='string'?b.default_branch:'main',labels:new Map(),issues:new Map(),pulls:new Map()};
+    const meta:RepoMeta={id:repositories.size+1,owner,name,description:typeof b.description==='string'?b.description:'',private:b.private!==false,default_branch:typeof b.default_branch==='string'?b.default_branch:'main',labels:new Map(),issues:new Map(),pulls:new Map()};
     new RepoStore(owner,name).create();repositories.set(key,meta);sendJson(res,201,{id:repositories.size,name,full_name:`${owner}/${name}`,owner:{login:owner},private:meta.private,default_branch:meta.default_branch,description:meta.description});return;
   }
   if(method==='GET'&&path==='/api/v3/user/repos'){
@@ -141,7 +184,7 @@ async function rest(req:IncomingMessage,res:ServerResponse):Promise<void>{
   }
   notFound(res);
 }
-function repoJson(r:RepoMeta){return {id:repositories.size,name:r.name,full_name:`${r.owner}/${r.name}`,owner:{login:r.owner},private:r.private,default_branch:r.default_branch,description:r.description};}
+function repoJson(r:RepoMeta){return {id:r.id,name:r.name,full_name:`${r.owner}/${r.name}`,owner:{login:r.owner},private:r.private,default_branch:r.default_branch,description:r.description};}
 
 export function createApp(): Server {
  return createServer((req,res)=>{
@@ -149,6 +192,7 @@ export function createApp(): Server {
   const gitMatch=/^\/([^/]+)\/([^/]+)\.git\/(info\/refs|git-upload-pack|git-receive-pack)$/.exec(path);
   if(gitMatch){const owner=decodeURIComponent(gitMatch[1]!),repo=decodeURIComponent(gitMatch[2]!),endpoint=gitMatch[3]!,query=new URL(req.url??'/','http://entry').searchParams;const action=endpoint==='info/refs'?'info':endpoint==='git-upload-pack'?'upload':'receive';const service=endpoint==='git-receive-pack'?'git-receive-pack':endpoint==='git-upload-pack'?'git-upload-pack':query.get('service')??'';void handleGit(req,res,owner,repo,service,action,new RepoStore(owner,repo));return;}
   if(method==='GET'&&path==='/healthz'){sendJson(res,200,{ok:true});return;}
+  if(path==='/api/graphql'){void graphql(req,res).catch(()=>{if(!res.headersSent)sendJson(res,500,{message:'Internal Server Error'});});return;}
   if(path==='/api/v3'||path.startsWith('/api/v3/')){void rest(req,res).catch(()=>{if(!res.headersSent)sendJson(res,500,{message:'Internal Server Error'});});return;}
   notFound(res);
  });
