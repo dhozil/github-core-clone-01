@@ -9,7 +9,7 @@ const flush=()=>Buffer.from('0000');
 function json(res:ServerResponse,status:number,body:any){const b=Buffer.from(JSON.stringify(body)+'\n');res.writeHead(status,{'content-type':'application/json; charset=utf-8','content-length':b.length,'x-github-request-id':cryptoId()});res.end(b);}
 function cryptoId(){return Math.random().toString(36).slice(2,14).toUpperCase();}
 function gitReply(res:ServerResponse,type:string,b:Buffer){res.writeHead(200,{'content-type':type,'content-length':b.length,'x-github-request-id':cryptoId(),'cache-control':'no-cache'});res.end(b);}
-async function body(req:IncomingMessage){const chunks:Buffer[]=[];for await(const c of req)chunks.push(Buffer.from(c));return Buffer.concat(chunks);}
+async function body(req:IncomingMessage){const chunks:Buffer[]=[];for await(const c of req)chunks.push(c);return chunks.length===1?chunks[0]!:Buffer.concat(chunks);}
 function decodePackets(b:Buffer){let p=0;const out:{payload:Buffer;end:number}[]=[];while(p+4<=b.length){const n=parseInt(b.toString('ascii',p,p+4),16);if(!Number.isFinite(n))throw Error('invalid pkt-line');p+=4;if(n===0)return {out,p};if(n===1||n===2)continue;if(n<4||p+n-4>b.length)throw Error('truncated pkt-line');out.push({payload:b.subarray(p,p+n-4),end:p+n-4});p+=n-4;}return {out,p};}
 function refList(store:RepoStore){const refs=store.refs(),head=store.head(),out=[...refs].sort(([a],[b])=>a.localeCompare(b));if(head.target)out.unshift(['HEAD',head.oid??ZERO] as [string,string]);else if(head.oid)out.unshift(['HEAD',head.oid]);return out;}
 function peel(store:RepoStore,oid:string){let obj=store.object(oid);while(obj?.type==='tag'){const m=/^object ([0-9a-f]{40})/m.exec(obj.data.toString());if(!m)return '';oid=m[1]!;obj=store.object(oid);}return oid;}
