@@ -1,3 +1,4 @@
+import { readBytes } from './src/http-body.ts';
 import { createHash } from 'node:crypto';
 import { ByteCache } from './src/cache.ts';
 import { initializeStore } from './src/store-root.ts';
@@ -21,17 +22,20 @@ let requestSequence = 0;
 // The protocol only requires a non-empty request id. A monotonic value avoids a synchronous crypto
 // call on every hot REST response while remaining unique for this server process.
 const reqId = () => (++requestSequence).toString(16).padStart(12, '0').toUpperCase();
-function sendJson(res: ServerResponse, status: number, body: unknown, headers: Record<string,string> = {}, cache?: ByteCache<object,{ text: string; length: number }>) {
+const jsonHeaders: (string | number)[] = ['content-type', JSON_TYPE, 'content-length', 0, 'x-github-request-id', ''];
+function sendJson(res: ServerResponse, status: number, body: unknown, headers?: Record<string,string>, cache?: ByteCache<object,{ text: string; length: number }>) {
   const rid = reqId();
   if (status === 204) { res.writeHead(status, { 'content-type': JSON_TYPE, 'x-github-request-id': rid, ...headers }); res.end(); return; }
   let cached = body !== null && typeof body === 'object' ? cache?.get(body) : undefined;
   if (cached === undefined) { const text = `${JSON.stringify(body)}\n`; cached = { text, length: Buffer.byteLength(text) }; if (body !== null && typeof body === 'object') cache?.set(body, cached, cached.length); }
-  res.writeHead(status, { 'content-type': JSON_TYPE, 'content-length': cached.length, 'x-github-request-id': rid, ...headers }); res.end(cached.text);
+  jsonHeaders[3] = cached.length;
+  jsonHeaders[5] = rid;
+  res.writeHead(status, headers ? { 'content-type': JSON_TYPE, 'content-length': cached.length, 'x-github-request-id': rid, ...headers } : jsonHeaders);
+  res.end(cached.text);
 }
 function pathOf(req: IncomingMessage): string { const raw=req.url??'/'; if(!raw.startsWith('/')||raw.includes('\\')||raw.includes('/.')||/[\r\n\t]/.test(raw)){try{return new URL(raw,'http://entry').pathname;}catch{return '/';}} const end=raw.indexOf('?');const path=end<0?raw:raw.slice(0,end);const hash=path.indexOf('#');return hash<0?path:path.slice(0,hash); }
 async function readBody(req: IncomingMessage): Promise<AnyObj> {
-  const chunks: Buffer[] = []; for await (const chunk of req) chunks.push(Buffer.from(chunk));
-  const raw = Buffer.concat(chunks).toString('utf8');
+  const raw = (await readBytes(req)).toString('utf8');
   if (!raw) throw new Error('Invalid JSON');
   const value = JSON.parse(raw); if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('Invalid JSON');
   return value;
@@ -162,10 +166,17 @@ async function rest(req:IncomingMessage,res:ServerResponse):Promise<void>{
     if(tail[0]==='issues'){
       if(tail.length===1&&method==='GET'){const state=url.searchParams.get('state')??'open',direction=url.searchParams.get('direction')==='asc'?1:-1;const list=[...meta.issues.values()].filter(i=>state==='all'||i.state===state).sort((a,b)=>(a.number-b.number)*direction);sendJson(res,200,list);return;}
       if(tail.length===1&&method==='POST'){
-        let b:AnyObj;try{b=await readBody(req);}catch{sendJson(res,400,{message:'Invalid JSON'});return;}const names=Array.isArray(b.labels)?b.labels.map((x:any)=>typeof x==='string'?x:String(x?.name??'')):[];if(names.some((x:string)=>!meta.labels.has(x.toLowerCase()))){sendJson(res,422,{message:'Validation Failed'});return;}const number=++issueNumber,issue={id:number,number,title:String(b.title??''),body:String(b.body??''),state:'open',labels:names.map((n:string)=>meta.labels.get(n.toLowerCase())),created_at:new Date().toISOString()};meta.issues.set(issue.number,issue);sendJson(res,201,issue);return;
+        let b:AnyObj;try{b=await readBody(req);}catch{sendJson(res,400,{message:'Invalid JSON'});return;}const labels:AnyObj[]=[];
+        if(Array.isArray(b.labels)) for(const entry of b.labels){
+          const name=typeof entry==='string'?entry:String(entry?.name??'');
+          const label=meta.labels.get(name.toLowerCase());
+          if(!label){sendJson(res,422,{message:'Validation Failed'});return;}
+          labels.push(label);
+        }
+        const number=++issueNumber,issue={id:number,number,title:String(b.title??''),body:String(b.body??''),state:'open',labels,created_at:new Date().toISOString()};meta.issues.set(issue.number,issue);sendJson(res,201,issue);return;
       }
       const n=Number(tail[1]);const issue=getIssue(meta,n);if(!Number.isInteger(n)||!issue){notFound(res);return;}
-      if(tail.length===2&&method==='GET'){sendJson(res,200,issue,{},issueJsonCache);return;}
+      if(tail.length===2&&method==='GET'){sendJson(res,200,issue,undefined,issueJsonCache);return;}
       if(tail.length===2&&method==='PATCH'){let b:AnyObj;try{b=await readBody(req);}catch{sendJson(res,400,{message:'Invalid JSON'});return;}if(b.state==='closed'||b.state==='open')issue.state=b.state;issueJsonCache.delete(issue);sendJson(res,200,issue);return;}
       if(tail[2]==='comments'){
         if(method==='POST'){let b:AnyObj;try{b=await readBody(req);}catch{sendJson(res,400,{message:'Invalid JSON'});return;}const c={id:++commentId,body:String(b.body??'')};(issue.comments??=[]).push(c);issueJsonCache.delete(issue);sendJson(res,201,c);return;}
@@ -200,19 +211,20 @@ export function createApp(): Server {
  initializeStore();
  const fail = (res: ServerResponse) => { if (!res.headersSent) sendJson(res,500,{message:'Internal Server Error'}); else res.destroy(); };
  return createServer((req,res)=>{
+  res.socket?.setNoDelay(true);
   try {
   // The timed issue-GET path is common and has no meaningful query parameters. Route the
   // ordinary unencoded form directly, avoiding duplicate URL parsing and path-array allocation.
   const fastIssue=/^\/api\/v3\/repos\/([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)\/issues\/([0-9]+)(?:\?|$)/.exec(req.url??'');
-  if((req.method??'GET')==='GET'&&fastIssue){const token=process.env.MAKEFUN_SHOP_TOKEN??'';if(!token||req.headers.authorization!==`Bearer ${token}`){sendJson(res,401,{message:'Bad credentials'});return;}const owner=fastIssue[1]!,meta=repository(owner,fastIssue[2]!);if(owner.toLowerCase()!==VIEWER||!meta){notFound(res);return;}const n=Number(fastIssue[3]),issue=getIssue(meta,n);if(!Number.isInteger(n)||!issue){notFound(res);return;}sendJson(res,200,issue,{},issueJsonCache);return;}
+  if((req.method??'GET')==='GET'&&fastIssue){const token=process.env.MAKEFUN_SHOP_TOKEN??'';if(!token||req.headers.authorization!==`Bearer ${token}`){sendJson(res,401,{message:'Bad credentials'});return;}const owner=fastIssue[1]!,meta=repository(owner,fastIssue[2]!);if(owner.toLowerCase()!==VIEWER||!meta){notFound(res);return;}const n=Number(fastIssue[3]),issue=getIssue(meta,n);if(!Number.isInteger(n)||!issue){notFound(res);return;}sendJson(res,200,issue,undefined,issueJsonCache);return;}
   const path=pathOf(req),method=req.method??'GET';
   const gitMatch=/^\/([^/]+)\/([^/]+)\.git\/(info\/refs|git-upload-pack|git-receive-pack)$/.exec(path);
-  if(gitMatch){const owner=decodeURIComponent(gitMatch[1]!),repo=decodeURIComponent(gitMatch[2]!),endpoint=gitMatch[3]!,query=new URLSearchParams((req.url??'').split('?',2)[1]??'');const action=endpoint==='info/refs'?'info':endpoint==='git-upload-pack'?'upload':'receive';const service=endpoint==='git-receive-pack'?'git-receive-pack':endpoint==='git-upload-pack'?'git-upload-pack':query.get('service')??'';void handleGit(req,res,owner,repo,service,action,new RepoStore(owner,repo)).catch(()=>fail(res));return;}
+  if(gitMatch){const owner=decodeURIComponent(gitMatch[1]!),repo=decodeURIComponent(gitMatch[2]!),endpoint=gitMatch[3]!;const action=endpoint==='info/refs'?'info':endpoint==='git-upload-pack'?'upload':'receive';const service=endpoint==='git-receive-pack'?'git-receive-pack':endpoint==='git-upload-pack'?'git-upload-pack':new URLSearchParams((req.url??'').split('?',2)[1]??'').get('service')??'';void handleGit(req,res,owner,repo,service,action,new RepoStore(owner,repo)).catch(()=>fail(res));return;}
   if(method==='GET'&&path==='/healthz'){sendJson(res,200,{ok:true});return;}
   if(path==='/mcp'&&method==='POST'){void handleMcp(req,res,{token:process.env.MAKEFUN_SHOP_TOKEN??'',viewer:VIEWER,repo:repository,createRepo:(name)=>{const meta:RepoMeta={id:repositories.size+1,owner:VIEWER,name,description:'',private:true,default_branch:'main',labels:new Map(),issues:new Map(),pulls:new Map()};new RepoStore(VIEWER,name).create();repositories.set(keyOf(VIEWER,name),meta);return repoJson(meta);},nextIssue:()=>++issueNumber,merge:mergePullForGraphQL}).catch(()=>fail(res));return;}
   if(path==='/api/graphql'){void graphql(req,res).catch(()=>{if(!res.headersSent)sendJson(res,500,{message:'Internal Server Error'});});return;}
   if(path==='/api/v3'||path.startsWith('/api/v3/')){void rest(req,res).catch(()=>{if(!res.headersSent)sendJson(res,500,{message:'Internal Server Error'});});return;}
   notFound(res);
   } catch { fail(res); }
- });
+ }).on('connection', socket => socket.setNoDelay(true));
 }
