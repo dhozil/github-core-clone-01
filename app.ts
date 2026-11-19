@@ -211,15 +211,15 @@ export function createApp(): Server {
  initializeStore();
  const fail = (res: ServerResponse) => { if (!res.headersSent) sendJson(res,500,{message:'Internal Server Error'}); else res.destroy(); };
  return createServer((req,res)=>{
-  res.socket?.setNoDelay(true);
   try {
   // The timed issue-GET path is common and has no meaningful query parameters. Route the
   // ordinary unencoded form directly, avoiding duplicate URL parsing and path-array allocation.
-  const fastIssue=/^\/api\/v3\/repos\/([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)\/issues\/([0-9]+)(?:\?|$)/.exec(req.url??'');
-  if((req.method??'GET')==='GET'&&fastIssue){const token=process.env.MAKEFUN_SHOP_TOKEN??'';if(!token||req.headers.authorization!==`Bearer ${token}`){sendJson(res,401,{message:'Bad credentials'});return;}const owner=fastIssue[1]!,meta=repository(owner,fastIssue[2]!);if(owner.toLowerCase()!==VIEWER||!meta){notFound(res);return;}const n=Number(fastIssue[3]),issue=getIssue(meta,n);if(!Number.isInteger(n)||!issue){notFound(res);return;}sendJson(res,200,issue,undefined,issueJsonCache);return;}
+  const rawPath=req.url??'';
+  const fastIssue=(req.method??'GET')==='GET'&&rawPath.startsWith('/api/v3/repos/')?/^\/api\/v3\/repos\/([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)\/issues\/([0-9]+)(?:\?|$)/.exec(rawPath):null;
+  if(fastIssue){const token=process.env.MAKEFUN_SHOP_TOKEN??'';if(!token||req.headers.authorization!==`Bearer ${token}`){sendJson(res,401,{message:'Bad credentials'});return;}const owner=fastIssue[1]!,meta=repository(owner,fastIssue[2]!);if(owner.toLowerCase()!==VIEWER||!meta){notFound(res);return;}const n=Number(fastIssue[3]),issue=getIssue(meta,n);if(!Number.isInteger(n)||!issue){notFound(res);return;}sendJson(res,200,issue,undefined,issueJsonCache);return;}
   const path=pathOf(req),method=req.method??'GET';
   const gitMatch=/^\/([^/]+)\/([^/]+)\.git\/(info\/refs|git-upload-pack|git-receive-pack)$/.exec(path);
-  if(gitMatch){const owner=decodeURIComponent(gitMatch[1]!),repo=decodeURIComponent(gitMatch[2]!),endpoint=gitMatch[3]!;const action=endpoint==='info/refs'?'info':endpoint==='git-upload-pack'?'upload':'receive';const service=endpoint==='git-receive-pack'?'git-receive-pack':endpoint==='git-upload-pack'?'git-upload-pack':new URLSearchParams((req.url??'').split('?',2)[1]??'').get('service')??'';void handleGit(req,res,owner,repo,service,action,new RepoStore(owner,repo)).catch(()=>fail(res));return;}
+  if(gitMatch){const owner=decodeURIComponent(gitMatch[1]!),repo=decodeURIComponent(gitMatch[2]!),endpoint=gitMatch[3]!;const action=endpoint==='info/refs'?'info':endpoint==='git-upload-pack'?'upload':'receive';let service='';if(endpoint==='git-receive-pack')service='git-receive-pack';else if(endpoint==='git-upload-pack')service='git-upload-pack';else{const raw=req.url??'',q=raw.indexOf('?');if(q>=0){const query=raw.slice(q+1);service=query==='service=git-receive-pack'?'git-receive-pack':query==='service=git-upload-pack'?'git-upload-pack':new URLSearchParams(raw.split('?',2)[1]).get('service')??'';}}void handleGit(req,res,owner,repo,service,action,new RepoStore(owner,repo)).catch(()=>fail(res));return;}
   if(method==='GET'&&path==='/healthz'){sendJson(res,200,{ok:true});return;}
   if(path==='/mcp'&&method==='POST'){void handleMcp(req,res,{token:process.env.MAKEFUN_SHOP_TOKEN??'',viewer:VIEWER,repo:repository,createRepo:(name)=>{const meta:RepoMeta={id:repositories.size+1,owner:VIEWER,name,description:'',private:true,default_branch:'main',labels:new Map(),issues:new Map(),pulls:new Map()};new RepoStore(VIEWER,name).create();repositories.set(keyOf(VIEWER,name),meta);return repoJson(meta);},nextIssue:()=>++issueNumber,merge:mergePullForGraphQL}).catch(()=>fail(res));return;}
   if(path==='/api/graphql'){void graphql(req,res).catch(()=>{if(!res.headersSent)sendJson(res,500,{message:'Internal Server Error'});});return;}
