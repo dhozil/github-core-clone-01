@@ -1,5 +1,4 @@
 import { readBytes } from './http-body.ts';
-import { pipeline } from 'node:stream/promises';
 import { ByteCache } from './cache.ts';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { RepoStore, ZERO, parseCommit, parseTree, type GitObject } from './store.ts';
@@ -51,8 +50,7 @@ function replyPack(res:ServerResponse, prefix:Buffer[], pack:Buffer):Promise<voi
     gitReply(res,type,framed[key] ??= Buffer.concat([...chunks()]));
     return;
   }
-  res.writeHead(200,{'content-type':type,'x-github-request-id':cryptoId(),'cache-control':'no-cache'});
-  return pipeline(chunks(),res);
+  gitReply(res,type,Buffer.concat([...chunks()]));
 }
 function packWant(store:RepoStore,wants:string[],haves:string[],depth?:number,shallow:string[]=[]){const all=closure(store,wants,depth).objects,known=new Set<string>();for(const h of haves)for(const id of closure(store,[h],undefined,shallow).objects.keys())known.add(id);for(const id of known)all.delete(id);return all;}
 const packedCache=new ByteCache<string,Buffer>(24*1024*1024);

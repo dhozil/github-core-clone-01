@@ -2,7 +2,8 @@ import { readBytes } from './src/http-body.ts';
 import { createHash } from 'node:crypto';
 import { ByteCache } from './src/cache.ts';
 import { initializeStore } from './src/store-root.ts';
-import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
+import { STATUS_CODES, type IncomingMessage, type ServerResponse } from 'node:http';
+import { createServer, type Server, type Socket } from 'node:net';
 import { RepoStore, ZERO, buildTree, parseTree, type GitObject, type TreeEntry } from './src/store.ts';
 import { handleGit } from './src/git-http.ts';
 import { executeGraphQL } from './src/graphql.ts';
@@ -207,24 +208,89 @@ async function rest(req:IncomingMessage,res:ServerResponse):Promise<void>{
 }
 function repoJson(r:RepoMeta){return {id:r.id,name:r.name,full_name:`${r.owner}/${r.name}`,owner:{login:r.owner},private:r.private,default_branch:r.default_branch,description:r.description};}
 
+function parseHead(buffer: Buffer, end: number): { method: string; target: string; version: string; headers: Record<string, string>; bodyOffset: number } {
+ const lineEnd=buffer.indexOf('\r\n');if(lineEnd<0||lineEnd>=end)throw new Error('Bad request');
+ const requestLine=buffer.toString('ascii',0,lineEnd),firstSpace=requestLine.indexOf(' '),lastSpace=requestLine.lastIndexOf(' ');
+ if(firstSpace<=0||lastSpace<=firstSpace)throw new Error('Bad request');
+ const method=requestLine.slice(0,firstSpace),target=requestLine.slice(firstSpace+1,lastSpace),version=requestLine.slice(lastSpace+1);
+ if(!target||!(version==='HTTP/1.1'||version==='HTTP/1.0'))throw new Error('Bad request');
+ const headers:Record<string,string>={};let pos=lineEnd+2;
+ while(pos<end){const lineEndAt=buffer.indexOf('\r\n',pos);if(lineEndAt<0||lineEndAt>end)throw new Error('Bad request');const colon=buffer.indexOf(':',pos);if(colon<0||colon>=lineEndAt||colon===pos)throw new Error('Bad header');const name=buffer.toString('ascii',pos,colon).toLowerCase();let value=buffer.toString('latin1',colon+1,lineEndAt).trim();if(!/^[!#$%&'*+.^_`|~0-9a-z-]+$/.test(name))throw new Error('Bad header');if(headers[name]!==undefined)headers[name]=name==='cookie'?`${headers[name]}; ${value}`:`${headers[name]}, ${value}`;else headers[name]=value;pos=lineEndAt+2;}
+ return {method,target,version,headers,bodyOffset:end+4};
+}
+function parseRequestBody(buffer:Buffer,head:ReturnType<typeof parseHead>):{body:Buffer;consumed:number}|undefined {
+ const transfer=head.headers['transfer-encoding'];
+ if(transfer?.toLowerCase().split(',').some(value=>value.trim()==='chunked')){
+  let pos=head.bodyOffset;const chunks:Buffer[]=[];let total=0;
+  while(true){const lineEnd=buffer.indexOf('\r\n',pos);if(lineEnd<0)return;const sizeText=buffer.toString('ascii',pos,lineEnd).split(';',1)[0]!.trim();if(!/^[0-9a-f]+$/i.test(sizeText))throw new Error('Bad chunk');const size=Number.parseInt(sizeText,16);pos=lineEnd+2;if(size===0){const trailerEnd=buffer.indexOf('\r\n\r\n',pos);if(trailerEnd>=0)return {body:chunks.length?Buffer.concat(chunks,total):Buffer.alloc(0),consumed:trailerEnd+4};if(buffer.length>=pos+2&&buffer[pos]===13&&buffer[pos+1]===10)return {body:chunks.length?Buffer.concat(chunks,total):Buffer.alloc(0),consumed:pos+2};return;}
+   if(!Number.isSafeInteger(size)||size<0)throw new Error('Bad chunk');if(buffer.length<pos+size+2)return;if(buffer[pos+size]!==13||buffer[pos+size+1]!==10)throw new Error('Bad chunk');chunks.push(buffer.subarray(pos,pos+size));total+=size;pos+=size+2;
+  }
+ }
+ const rawLength=head.headers['content-length'];if(rawLength===undefined)return {body:Buffer.alloc(0),consumed:head.bodyOffset};if(!/^[0-9]+$/.test(rawLength))throw new Error('Bad length');const length=Number(rawLength);if(!Number.isSafeInteger(length)||length<0)throw new Error('Bad length');if(buffer.length<head.bodyOffset+length)return;return {body:buffer.subarray(head.bodyOffset,head.bodyOffset+length),consumed:head.bodyOffset+length};
+}
+class RawResponse {
+ status=200;headers:Record<string,string|string[]>={};headersSent=false;finished=false;private chunks:Buffer[]=[];private size=0;private complete!:()=>void;done:Promise<void>;
+ socket:Socket;private method:string;private keepAlive:boolean;
+ constructor(socket:Socket,method:string,keepAlive:boolean){this.socket=socket;this.method=method;this.keepAlive=keepAlive;this.done=new Promise(resolve=>{this.complete=resolve;});}
+ writeHead(status:number,headers?:any):this {
+  this.status=status;this.headersSent=true;let values=headers;if(Array.isArray(values)){const mapped:Record<string,string|string[]>={};for(let i=0;i<values.length;i+=2){const key=String(values[i]).toLowerCase(),value=String(values[i+1]);mapped[key]=mapped[key]===undefined?value:`${mapped[key]}, ${value}`;}values=mapped;}
+  if(values)for(const [key,value] of Object.entries(values))if(value!==undefined)this.headers[key.toLowerCase()]=Array.isArray(value)?value.map(String):String(value);
+  return this;
+ }
+ write(chunk:Buffer|string):boolean{const value=Buffer.isBuffer(chunk)?chunk:Buffer.from(chunk);this.chunks.push(value);this.size+=value.length;return true;}
+ end(chunk?:Buffer|string):this {
+  if(chunk!==undefined)this.write(chunk);const body=this.size?Buffer.concat(this.chunks,this.size):Buffer.alloc(0),status=this.status,bodyAllowed=status>=200&&status!==204&&status!==304,wireBody=this.method==='HEAD'||!bodyAllowed?Buffer.alloc(0):body;
+  if(bodyAllowed&&!('content-length'in this.headers))this.headers['content-length']=String(body.length);
+  if(!bodyAllowed){delete this.headers['content-length'];delete this.headers['transfer-encoding'];}
+  this.headers.connection=this.keepAlive?'keep-alive':'close';let head=`HTTP/1.1 ${status} ${STATUS_CODES[status]??'Unknown'}\r\n`;
+  for(const [key,value] of Object.entries(this.headers))for(const item of Array.isArray(value)?value:[value])head+=`${key}: ${item}\r\n`;
+  this.socket.write(Buffer.concat([Buffer.from(`${head}\r\n`),wireBody]));this.chunks=[];this.size=0;this.finished=true;this.complete();return this;
+ }
+ destroy(error?:Error):this{if(!this.socket.destroyed)this.socket.destroy(error);this.finished=true;this.complete();return this;}
+}
+class BufferedRequest implements AsyncIterable<Buffer> {
+ url:string;method:string;headers:Record<string,any>;__rawBody:Buffer;
+ constructor(url:string,method:string,headers:Record<string,any>,body:Buffer){this.url=url;this.method=method;this.headers=headers;this.__rawBody=body;}
+ async *[Symbol.asyncIterator](){if(this.__rawBody.length)yield this.__rawBody;}
+}
+
 export function createApp(): Server {
  initializeStore();
- const fail = (res: ServerResponse) => { if (!res.headersSent) sendJson(res,500,{message:'Internal Server Error'}); else res.destroy(); };
- return createServer((req,res)=>{
-  try {
-  // The timed issue-GET path is common and has no meaningful query parameters. Route the
-  // ordinary unencoded form directly, avoiding duplicate URL parsing and path-array allocation.
-  const rawPath=req.url??'';
-  const fastIssue=(req.method??'GET')==='GET'&&rawPath.startsWith('/api/v3/repos/')?/^\/api\/v3\/repos\/([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)\/issues\/([0-9]+)(?:\?|$)/.exec(rawPath):null;
-  if(fastIssue){const token=process.env.MAKEFUN_SHOP_TOKEN??'';if(!token||req.headers.authorization!==`Bearer ${token}`){sendJson(res,401,{message:'Bad credentials'});return;}const owner=fastIssue[1]!,meta=repository(owner,fastIssue[2]!);if(owner.toLowerCase()!==VIEWER||!meta){notFound(res);return;}const n=Number(fastIssue[3]),issue=getIssue(meta,n);if(!Number.isInteger(n)||!issue){notFound(res);return;}sendJson(res,200,issue,undefined,issueJsonCache);return;}
-  const path=pathOf(req),method=req.method??'GET';
-  const gitMatch=/^\/([^/]+)\/([^/]+)\.git\/(info\/refs|git-upload-pack|git-receive-pack)$/.exec(path);
-  if(gitMatch){const owner=decodeURIComponent(gitMatch[1]!),repo=decodeURIComponent(gitMatch[2]!),endpoint=gitMatch[3]!;const action=endpoint==='info/refs'?'info':endpoint==='git-upload-pack'?'upload':'receive';let service='';if(endpoint==='git-receive-pack')service='git-receive-pack';else if(endpoint==='git-upload-pack')service='git-upload-pack';else{const raw=req.url??'',q=raw.indexOf('?');if(q>=0){const query=raw.slice(q+1);service=query==='service=git-receive-pack'?'git-receive-pack':query==='service=git-upload-pack'?'git-upload-pack':new URLSearchParams(raw.split('?',2)[1]).get('service')??'';}}void handleGit(req,res,owner,repo,service,action,new RepoStore(owner,repo)).catch(()=>fail(res));return;}
-  if(method==='GET'&&path==='/healthz'){sendJson(res,200,{ok:true});return;}
-  if(path==='/mcp'&&method==='POST'){void handleMcp(req,res,{token:process.env.MAKEFUN_SHOP_TOKEN??'',viewer:VIEWER,repo:repository,createRepo:(name)=>{const meta:RepoMeta={id:repositories.size+1,owner:VIEWER,name,description:'',private:true,default_branch:'main',labels:new Map(),issues:new Map(),pulls:new Map()};new RepoStore(VIEWER,name).create();repositories.set(keyOf(VIEWER,name),meta);return repoJson(meta);},nextIssue:()=>++issueNumber,merge:mergePullForGraphQL}).catch(()=>fail(res));return;}
-  if(path==='/api/graphql'){void graphql(req,res).catch(()=>{if(!res.headersSent)sendJson(res,500,{message:'Internal Server Error'});});return;}
-  if(path==='/api/v3'||path.startsWith('/api/v3/')){void rest(req,res).catch(()=>{if(!res.headersSent)sendJson(res,500,{message:'Internal Server Error'});});return;}
-  notFound(res);
-  } catch { fail(res); }
- }).on('connection', socket => socket.setNoDelay(true));
+ const server=createServer({allowHalfOpen:true},socket=>{
+  socket.setNoDelay(true);socket.setTimeout(5000,()=>socket.end());let input=Buffer.alloc(0),pumping=false,continueSent=false,stopped=false,activeResponse:RawResponse|undefined;
+  socket.on('data',chunk=>{input=input.length?Buffer.concat([input,chunk]):chunk;pump();});
+  socket.on('end',()=>{if(input.length)socket.destroy();});
+  socket.on('error',()=>{stopped=true;});socket.on('close',()=>{stopped=true;activeResponse?.destroy();});
+  async function pump(){
+   if(pumping||stopped||socket.destroyed)return;pumping=true;
+   try{while(!stopped&&!socket.destroyed){const headerEnd=input.indexOf('\r\n\r\n');if(headerEnd<0)break;let head:ReturnType<typeof parseHead>;let parsed:ReturnType<typeof parseRequestBody>;
+    try{head=parseHead(input,headerEnd);if(!continueSent&&head.headers.expect?.toLowerCase()==='100-continue'){socket.write('HTTP/1.1 100 Continue\r\n\r\n');continueSent=true;}parsed=parseRequestBody(input,head);}catch{socket.end('HTTP/1.1 400 Bad Request\r\nConnection: close\r\nContent-Length: 0\r\n\r\n');stopped=true;break;}
+    if(!parsed)break;input=input.subarray(parsed.consumed);continueSent=false;
+    const connection=head.headers.connection?.toLowerCase()??'',keepAlive=head.version==='HTTP/1.1'?connection!=='close':connection.split(',').some(value=>value.trim()==='keep-alive');
+    const headers:Record<string,any>={...head.headers};const body=head.method==='GET'||head.method==='HEAD'?Buffer.alloc(0):parsed.body;
+    const req=new BufferedRequest(head.target,head.method,headers,body) as unknown as IncomingMessage;
+    const res=new RawResponse(socket,head.method,keepAlive);activeResponse=res;
+    try{dispatch(req,res);}catch{if(!res.headersSent)res.writeHead(500,{'content-type':'application/json; charset=utf-8'}).end('{"message":"Internal Server Error"}\n');else res.destroy();}
+    if(!res.finished)await res.done;activeResponse=undefined;
+    if(!keepAlive){stopped=true;input=Buffer.alloc(0);socket.end();break;}
+   }}finally{pumping=false;if(!stopped&&!socket.destroyed&&input.length){const end=input.indexOf('\r\n\r\n');if(end>=0)queueMicrotask(pump);}}
+  }
+  function dispatch(req:IncomingMessage,res:ServerResponse){
+   const fail=(response:ServerResponse)=>{if(!response.headersSent)sendJson(response,500,{message:'Internal Server Error'});else response.destroy();};
+   try {
+    const rawPath=req.url??'';
+    const fastIssue=(req.method??'GET')==='GET'&&rawPath.startsWith('/api/v3/repos/')?/^\/api\/v3\/repos\/([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)\/issues\/([0-9]+)(?:\?|$)/.exec(rawPath):null;
+    if(fastIssue){const token=process.env.MAKEFUN_SHOP_TOKEN??'';if(!token||req.headers.authorization!==`Bearer ${token}`){sendJson(res,401,{message:'Bad credentials'});return;}const owner=fastIssue[1]!,meta=repository(owner,fastIssue[2]!);if(owner.toLowerCase()!==VIEWER||!meta){notFound(res);return;}const n=Number(fastIssue[3]),issue=getIssue(meta,n);if(!Number.isInteger(n)||!issue){notFound(res);return;}sendJson(res,200,issue,undefined,issueJsonCache);return;}
+    const path=pathOf(req),method=req.method??'GET';
+    const gitMatch=/^\/([^/]+)\/([^/]+)\.git\/(info\/refs|git-upload-pack|git-receive-pack)$/.exec(path);
+    if(gitMatch){const owner=decodeURIComponent(gitMatch[1]!),repo=decodeURIComponent(gitMatch[2]!),endpoint=gitMatch[3]!;const action=endpoint==='info/refs'?'info':endpoint==='git-upload-pack'?'upload':'receive';let service='';if(endpoint==='git-receive-pack')service='git-receive-pack';else if(endpoint==='git-upload-pack')service='git-upload-pack';else{const raw=req.url??'',q=raw.indexOf('?');if(q>=0){const query=raw.slice(q+1);service=query==='service=git-receive-pack'?'git-receive-pack':query==='service=git-upload-pack'?'git-upload-pack':new URLSearchParams(raw.split('?',2)[1]).get('service')??'';}}void handleGit(req,res,owner,repo,service,action,new RepoStore(owner,repo)).catch(()=>fail(res));return;}
+    if(method==='GET'&&path==='/healthz'){sendJson(res,200,{ok:true});return;}
+    if(path==='/mcp'&&method==='POST'){void handleMcp(req,res,{token:process.env.MAKEFUN_SHOP_TOKEN??'',viewer:VIEWER,repo:repository,createRepo:(name)=>{const meta:RepoMeta={id:repositories.size+1,owner:VIEWER,name,description:'',private:true,default_branch:'main',labels:new Map(),issues:new Map(),pulls:new Map()};new RepoStore(VIEWER,name).create();repositories.set(keyOf(VIEWER,name),meta);return repoJson(meta);},nextIssue:()=>++issueNumber,merge:mergePullForGraphQL}).catch(()=>fail(res));return;}
+    if(path==='/api/graphql'){void graphql(req,res).catch(()=>{if(!res.headersSent)sendJson(res,500,{message:'Internal Server Error'});});return;}
+    if(path==='/api/v3'||path.startsWith('/api/v3/')){void rest(req,res).catch(()=>{if(!res.headersSent)sendJson(res,500,{message:'Internal Server Error'});});return;}
+    notFound(res);
+   }catch{fail(res);}
+  }
+ });
+ return server;
 }
