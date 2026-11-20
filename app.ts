@@ -208,22 +208,42 @@ async function rest(req:IncomingMessage,res:ServerResponse):Promise<void>{
 }
 function repoJson(r:RepoMeta){return {id:r.id,name:r.name,full_name:`${r.owner}/${r.name}`,owner:{login:r.owner},private:r.private,default_branch:r.default_branch,description:r.description};}
 
+const TOKEN_SPECIALS = "!#$%&'*+-.^_`|~";
+function isToken(value:string):boolean{for(let i=0;i<value.length;i++){const c=value.charCodeAt(i);if(!((c>=48&&c<=57)||(c>=65&&c<=90)||(c>=97&&c<=122)||TOKEN_SPECIALS.includes(value[i]!)))return false;}return value.length>0;}
+function hasInvalidControl(value:string,allowTab=false):boolean{for(let i=0;i<value.length;i++){const c=value.charCodeAt(i);if(c===127||(c<32&&!(allowTab&&c===9)))return true;}return false;}
 function parseHead(buffer: Buffer, end: number): { method: string; target: string; version: string; headers: Record<string, string>; bodyOffset: number } {
  const lineEnd=buffer.indexOf('\r\n');if(lineEnd<0||lineEnd>=end)throw new Error('Bad request');
  const requestLine=buffer.toString('ascii',0,lineEnd),firstSpace=requestLine.indexOf(' '),lastSpace=requestLine.lastIndexOf(' ');
  if(firstSpace<=0||lastSpace<=firstSpace)throw new Error('Bad request');
- const method=requestLine.slice(0,firstSpace),target=requestLine.slice(firstSpace+1,lastSpace),version=requestLine.slice(lastSpace+1);
- if(!target||!(version==='HTTP/1.1'||version==='HTTP/1.0'))throw new Error('Bad request');
+ const method=requestLine.slice(0,firstSpace),rawTarget=requestLine.slice(firstSpace+1,lastSpace),version=requestLine.slice(lastSpace+1);
+ if(!isToken(method)||!rawTarget||hasInvalidControl(rawTarget)||!(version==='HTTP/1.1'||version==='HTTP/1.0'))throw new Error('Bad request');
+ // Proxies may send absolute-form targets. Convert them to the origin-form URL used by
+ // the handlers while preserving the query string (which carries Git service selection).
+ let target=rawTarget;
+ if(rawTarget[0]!=='/'&&rawTarget!=='*'){
+  const schemeEnd=rawTarget.indexOf('://'),scheme=schemeEnd<0?'':rawTarget.slice(0,schemeEnd).toLowerCase();if(scheme!=='http'&&scheme!=='https')throw new Error('Bad request');
+  let absolute:URL;try{absolute=new URL(rawTarget);}catch{throw new Error('Bad request');}
+  if((absolute.protocol!=='http:'&&absolute.protocol!=='https:')||!absolute.hostname)throw new Error('Bad request');
+  target=`${absolute.pathname||'/'}${absolute.search}`;
+ }
  const headers:Record<string,string>={};let pos=lineEnd+2;
- while(pos<end){const lineEndAt=buffer.indexOf('\r\n',pos);if(lineEndAt<0||lineEndAt>end)throw new Error('Bad request');const colon=buffer.indexOf(':',pos);if(colon<0||colon>=lineEndAt||colon===pos)throw new Error('Bad header');const name=buffer.toString('ascii',pos,colon).toLowerCase();let value=buffer.toString('latin1',colon+1,lineEndAt).trim();if(!/^[!#$%&'*+.^_`|~0-9a-z-]+$/.test(name))throw new Error('Bad header');if(headers[name]!==undefined)headers[name]=name==='cookie'?`${headers[name]}; ${value}`:`${headers[name]}, ${value}`;else headers[name]=value;pos=lineEndAt+2;}
+ while(pos<end){const lineEndAt=buffer.indexOf('\r\n',pos);if(lineEndAt<0||lineEndAt>end)throw new Error('Bad request');const colon=buffer.indexOf(':',pos);if(colon<0||colon>=lineEndAt||colon===pos)throw new Error('Bad header');const name=buffer.toString('ascii',pos,colon).toLowerCase();let value=buffer.toString('latin1',colon+1,lineEndAt).trim();if(!isToken(name)||hasInvalidControl(value,true))throw new Error('Bad header');if(headers[name]!==undefined)headers[name]=name==='cookie'?`${headers[name]}; ${value}`:`${headers[name]}, ${value}`;else headers[name]=value;pos=lineEndAt+2;}
  return {method,target,version,headers,bodyOffset:end+4};
 }
 function parseRequestBody(buffer:Buffer,head:ReturnType<typeof parseHead>):{body:Buffer;consumed:number}|undefined {
  const transfer=head.headers['transfer-encoding'];
- if(transfer?.toLowerCase().split(',').some(value=>value.trim()==='chunked')){
+ if(transfer!==undefined){
+  const codings=transfer.toLowerCase().split(',').map(value=>value.trim());
+  if(codings.length!==1||codings[0]!=='chunked'||head.headers['content-length']!==undefined)throw new Error('Bad transfer encoding');
   let pos=head.bodyOffset;const chunks:Buffer[]=[];let total=0;
-  while(true){const lineEnd=buffer.indexOf('\r\n',pos);if(lineEnd<0)return;const sizeText=buffer.toString('ascii',pos,lineEnd).split(';',1)[0]!.trim();if(!/^[0-9a-f]+$/i.test(sizeText))throw new Error('Bad chunk');const size=Number.parseInt(sizeText,16);pos=lineEnd+2;if(size===0){const trailerEnd=buffer.indexOf('\r\n\r\n',pos);if(trailerEnd>=0)return {body:chunks.length?Buffer.concat(chunks,total):Buffer.alloc(0),consumed:trailerEnd+4};if(buffer.length>=pos+2&&buffer[pos]===13&&buffer[pos+1]===10)return {body:chunks.length?Buffer.concat(chunks,total):Buffer.alloc(0),consumed:pos+2};return;}
-   if(!Number.isSafeInteger(size)||size<0)throw new Error('Bad chunk');if(buffer.length<pos+size+2)return;if(buffer[pos+size]!==13||buffer[pos+size+1]!==10)throw new Error('Bad chunk');chunks.push(buffer.subarray(pos,pos+size));total+=size;pos+=size+2;
+  while(true){const lineEnd=buffer.indexOf('\r\n',pos);if(lineEnd<0)return;if(lineEnd-pos>8192)throw new Error('Bad chunk');const sizeText=buffer.toString('ascii',pos,lineEnd).split(';',1)[0]!.trim();if(!/^[0-9a-f]+$/i.test(sizeText))throw new Error('Bad chunk');const size=Number.parseInt(sizeText,16);pos=lineEnd+2;
+   if(!Number.isSafeInteger(size)||size<0)throw new Error('Bad chunk');
+   if(size===0){
+    // Trailer fields end with their own empty CRLF line. Parse them incrementally so
+    // trailers and a pipelined following request can share the same TCP buffer.
+    while(true){const trailerEnd=buffer.indexOf('\r\n',pos);if(trailerEnd<0)return;if(trailerEnd===pos)return {body:chunks.length?Buffer.concat(chunks,total):Buffer.alloc(0),consumed:pos+2};if(trailerEnd-pos>8192)throw new Error('Bad trailer');const colon=buffer.indexOf(':',pos);if(colon<=pos||colon>=trailerEnd)throw new Error('Bad trailer');const name=buffer.toString('ascii',pos,colon).toLowerCase(),value=buffer.toString('latin1',colon+1,trailerEnd);if(!isToken(name)||hasInvalidControl(value,true))throw new Error('Bad trailer');pos=trailerEnd+2;}
+   }
+   if(buffer.length<pos+size+2)return;if(buffer[pos+size]!==13||buffer[pos+size+1]!==10)throw new Error('Bad chunk');chunks.push(buffer.subarray(pos,pos+size));total+=size;pos+=size+2;
   }
  }
  const rawLength=head.headers['content-length'];if(rawLength===undefined)return {body:Buffer.alloc(0),consumed:head.bodyOffset};if(!/^[0-9]+$/.test(rawLength))throw new Error('Bad length');const length=Number(rawLength);if(!Number.isSafeInteger(length)||length<0)throw new Error('Bad length');if(buffer.length<head.bodyOffset+length)return;return {body:buffer.subarray(head.bodyOffset,head.bodyOffset+length),consumed:head.bodyOffset+length};
@@ -257,15 +277,15 @@ class BufferedRequest implements AsyncIterable<Buffer> {
 export function createApp(): Server {
  initializeStore();
  const server=createServer({allowHalfOpen:true},socket=>{
-  socket.setNoDelay(true);socket.setTimeout(5000,()=>socket.end());let input=Buffer.alloc(0),pumping=false,continueSent=false,stopped=false,activeResponse:RawResponse|undefined;
+  socket.setNoDelay(true);socket.setTimeout(5000,()=>socket.end());let input=Buffer.alloc(0),pumping=false,continueSent=false,stopped=false,clientEnded=false,activeResponse:RawResponse|undefined;
   socket.on('data',chunk=>{input=input.length?Buffer.concat([input,chunk]):chunk;pump();});
-  socket.on('end',()=>{if(input.length)socket.destroy();});
+  socket.on('end',()=>{clientEnded=true;if(!pumping)pump();});
   socket.on('error',()=>{stopped=true;});socket.on('close',()=>{stopped=true;activeResponse?.destroy();});
   async function pump(){
    if(pumping||stopped||socket.destroyed)return;pumping=true;
-   try{while(!stopped&&!socket.destroyed){const headerEnd=input.indexOf('\r\n\r\n');if(headerEnd<0)break;let head:ReturnType<typeof parseHead>;let parsed:ReturnType<typeof parseRequestBody>;
-    try{head=parseHead(input,headerEnd);if(!continueSent&&head.headers.expect?.toLowerCase()==='100-continue'){socket.write('HTTP/1.1 100 Continue\r\n\r\n');continueSent=true;}parsed=parseRequestBody(input,head);}catch{socket.end('HTTP/1.1 400 Bad Request\r\nConnection: close\r\nContent-Length: 0\r\n\r\n');stopped=true;break;}
-    if(!parsed)break;input=input.subarray(parsed.consumed);continueSent=false;
+   try{while(!stopped&&!socket.destroyed){const headerEnd=input.indexOf('\r\n\r\n');if(headerEnd<0){if(clientEnded){if(input.length)socket.end('HTTP/1.1 400 Bad Request\r\nConnection: close\r\nContent-Length: 0\r\n\r\n');else socket.end();stopped=true;}break;}let head:ReturnType<typeof parseHead>;let parsed:ReturnType<typeof parseRequestBody>;
+    try{head=parseHead(input,headerEnd);const expect=head.headers.expect;if(!continueSent&&expect){const expectsContinue=expect.toLowerCase().split(',').some(value=>value.trim()==='100-continue'),length=head.headers['content-length'],awaitsBody=head.headers['transfer-encoding']!==undefined||(length!==undefined&&length!=='0');if(expectsContinue&&awaitsBody){socket.write('HTTP/1.1 100 Continue\r\n\r\n');continueSent=true;}}parsed=parseRequestBody(input,head);}catch{socket.end('HTTP/1.1 400 Bad Request\r\nConnection: close\r\nContent-Length: 0\r\n\r\n');stopped=true;break;}
+    if(!parsed){if(clientEnded){socket.end('HTTP/1.1 400 Bad Request\r\nConnection: close\r\nContent-Length: 0\r\n\r\n');stopped=true;}break;}input=input.subarray(parsed.consumed);continueSent=false;
     const connection=head.headers.connection?.toLowerCase()??'',keepAlive=head.version==='HTTP/1.1'?connection!=='close':connection.split(',').some(value=>value.trim()==='keep-alive');
     const headers:Record<string,any>={...head.headers};const body=head.method==='GET'||head.method==='HEAD'?Buffer.alloc(0):parsed.body;
     const req=new BufferedRequest(head.target,head.method,headers,body) as unknown as IncomingMessage;
@@ -273,7 +293,8 @@ export function createApp(): Server {
     try{dispatch(req,res);}catch{if(!res.headersSent)res.writeHead(500,{'content-type':'application/json; charset=utf-8'}).end('{"message":"Internal Server Error"}\n');else res.destroy();}
     if(!res.finished)await res.done;activeResponse=undefined;
     if(!keepAlive){stopped=true;input=Buffer.alloc(0);socket.end();break;}
-   }}finally{pumping=false;if(!stopped&&!socket.destroyed&&input.length){const end=input.indexOf('\r\n\r\n');if(end>=0)queueMicrotask(pump);}}
+    if(clientEnded&&input.length===0){stopped=true;socket.end();break;}
+   }}catch{if(!socket.destroyed)socket.end('HTTP/1.1 400 Bad Request\r\nConnection: close\r\nContent-Length: 0\r\n\r\n');stopped=true;input=Buffer.alloc(0);}finally{pumping=false;}
   }
   function dispatch(req:IncomingMessage,res:ServerResponse){
    const fail=(response:ServerResponse)=>{if(!response.headersSent)sendJson(response,500,{message:'Internal Server Error'});else response.destroy();};
