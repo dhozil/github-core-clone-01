@@ -7,7 +7,7 @@ export interface TreeEntry { mode:string; name:string; oid:string }
 export const ZERO='0'.repeat(40);
 interface RepositoryData { objects:Map<string,GitObject>; refs:Map<string,string>; head:string; advertisementVersion:number }
 const repositories=new Map<string,RepositoryData>();
-export function hashObject(type:ObjType,data:Uint8Array):string { const b=Buffer.from(data); return createHash('sha1').update(`${type} ${b.length}\0`).update(b).digest('hex'); }
+export function hashObject(type:ObjType,data:Uint8Array):string { return createHash('sha1').update(`${type} ${data.byteLength}\0`).update(data).digest('hex'); }
 export function parseCommit(data:Buffer) { const h=data.toString('utf8').split('\n\n',1)[0]!.split('\n'); return {tree:h.find(x=>x.startsWith('tree '))?.slice(5)??'',parents:h.filter(x=>x.startsWith('parent ')).map(x=>x.slice(7))}; }
 export function parseTree(data:Buffer):TreeEntry[] { const out:TreeEntry[]=[]; let i=0; while(i<data.length){const s=data.indexOf(32,i),n=data.indexOf(0,s+1); if(s<0||n<0||n+21>data.length) throw Error('bad tree');out.push({mode:data.subarray(i,s).toString(),name:data.subarray(s+1,n).toString(),oid:data.subarray(n+1,n+21).toString('hex')});i=n+21;}return out; }
 export function buildTree(entries:TreeEntry[]):Buffer { const sorted=[...entries].sort((a,b)=>Buffer.compare(Buffer.from(a.mode==='40000'?a.name+'/':a.name),Buffer.from(b.mode==='40000'?b.name+'/':b.name))); return Buffer.concat(sorted.flatMap(e=>[Buffer.from(`${e.mode} ${e.name}\0`),Buffer.from(e.oid,'hex')])); }
@@ -28,8 +28,8 @@ export class RepoStore {
   clearCaches(){}
   object(oid:string):GitObject|undefined{return this.data().objects.get(oid);}
   writeObject(obj:GitObject):string{return this.storeVerifiedObject(hashObject(obj.type,obj.data),obj);}
-  storeVerifiedObject(oid:string,obj:GitObject){const data=this.data();if(!data.objects.has(oid)){data.objects.set(oid,obj);if(obj.type=== 'tag')data.advertisementVersion++;}return oid;}
-  storeVerifiedObjects(objects:Map<string,GitObject>):number{const data=this.data();for(const [oid,obj] of objects)if(!data.objects.has(oid)){data.objects.set(oid,obj);if(obj.type=== 'tag')data.advertisementVersion++;}return objects.size;}
+  storeVerifiedObject(oid:string,obj:GitObject){const data=this.data();if(!data.objects.has(oid)){data.objects.set(oid,obj);data.advertisementVersion++;}return oid;}
+  storeVerifiedObjects(objects:Map<string,GitObject>):number{const data=this.data();for(const [oid,obj] of objects)if(!data.objects.has(oid)){data.objects.set(oid,obj);data.advertisementVersion++;}return objects.size;}
   advertisementVersion(){return this.data().advertisementVersion;}
   refs():Map<string,string>{return this.data().refs;}
   head():{oid?:string;target?:string}{const h=this.data().head;if(h.startsWith('ref: ')){const target=h.slice(5);return {target,oid:this.refs().get(target)};}return {oid:h};}

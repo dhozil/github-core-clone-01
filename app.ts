@@ -259,7 +259,7 @@ class RawResponse {
  }
  write(chunk:Buffer|string):boolean{const value=Buffer.isBuffer(chunk)?chunk:Buffer.from(chunk);this.chunks.push(value);this.size+=value.length;return true;}
  end(chunk?:Buffer|string):this {
-  if(chunk!==undefined)this.write(chunk);const body=this.size?Buffer.concat(this.chunks,this.size):Buffer.alloc(0),status=this.status,bodyAllowed=status>=200&&status!==204&&status!==304,wireBody=this.method==='HEAD'||!bodyAllowed?Buffer.alloc(0):body;
+  if(chunk!==undefined)this.write(chunk);const body=this.chunks.length===1?this.chunks[0]!:this.size?Buffer.concat(this.chunks,this.size):Buffer.alloc(0),status=this.status,bodyAllowed=status>=200&&status!==204&&status!==304,wireBody=this.method==='HEAD'||!bodyAllowed?Buffer.alloc(0):body;
   if(bodyAllowed&&!('content-length'in this.headers))this.headers['content-length']=String(body.length);
   if(!bodyAllowed){delete this.headers['content-length'];delete this.headers['transfer-encoding'];}
   this.headers.connection=this.keepAlive?'keep-alive':'close';let head=`HTTP/1.1 ${status} ${STATUS_CODES[status]??'Unknown'}\r\n`;

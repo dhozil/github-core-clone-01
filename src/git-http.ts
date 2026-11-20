@@ -29,35 +29,49 @@ function v0Advertisement(store: RepoStore, service: string): Buffer {
 function v2Advertisement(){return Buffer.concat([pkt('version 2\n'),pkt('agent=makefun\n'),pkt('object-format=sha1\n'),pkt('ls-refs=unborn\n'),pkt('fetch=shallow wait-for-done\n'),flush()]);}
 function closure(store:RepoStore,roots:string[],depth?:number,shallow:string[]=[]){const objects=new Map<string,GitObject>(),seen=new Set<string>(),boundaries:string[]=[];const q=roots.map(oid=>({oid,level:1}));while(q.length){const {oid,level}=q.shift()!;if(seen.has(oid))continue;seen.add(oid);const o=store.object(oid);if(!o)continue;objects.set(oid,o);if(o.type==='commit'){const c=parseCommit(o.data);if(c.tree)q.push({oid:c.tree,level});if(shallow.includes(oid)){boundaries.push(oid);continue;}if(depth&&level>=depth&&c.parents.length){boundaries.push(oid);continue;}for(const p of c.parents)q.push({oid:p,level:level+1});}else if(o.type==='tree'){for(const e of parseTree(o.data))if(e.mode!=='160000')q.push({oid:e.oid,level});}else if(o.type==='tag'){const m=/^object ([0-9a-f]{40})/m.exec(o.data.toString());if(m)q.push({oid:m[1]!,level});}}return {objects,boundaries};}
 const NAK = pkt('NAK\n'), PACKFILE = pkt('packfile\n');
-const framedPacks = new WeakMap<Buffer, { v0?: Buffer; v2?: Buffer }>();
-function replyPack(res:ServerResponse, prefix:Buffer[], pack:Buffer):Promise<void>|void {
-  const type='application/x-git-upload-pack-result';
-  function* chunks() {
-    yield* prefix;
-    for(let i=0;i<pack.length;i+=60000) {
-      const data=pack.subarray(i,i+60000);
-      yield Buffer.from((data.length+5).toString(16).padStart(4,'0')+'\x01');
-      yield data;
-    }
-    yield flush();
+const UPLOAD_RESULT = 'application/x-git-upload-pack-result';
+function framePack(prefix:Buffer[],pack:Buffer){
+  const parts=[...prefix];
+  for(let i=0;i<pack.length;i+=60000){
+    const data=pack.subarray(i,i+60000);
+    parts.push(Buffer.from((data.length+5).toString(16).padStart(4,'0')+'\x01'),data);
   }
-  if(pack.length<=1024*1024){
-    const key = prefix.length === 1 && prefix[0] === NAK ? 'v0'
-      : prefix.length === 1 && prefix[0] === PACKFILE ? 'v2' : undefined;
-    if (!key) { gitReply(res,type,Buffer.concat([...chunks()])); return; }
-    let framed = framedPacks.get(pack);
-    if (!framed) { framed = {}; framedPacks.set(pack, framed); }
-    gitReply(res,type,framed[key] ??= Buffer.concat([...chunks()]));
-    return;
-  }
-  gitReply(res,type,Buffer.concat([...chunks()]));
+  parts.push(FLUSH);
+  return Buffer.concat(parts);
 }
-function packWant(store:RepoStore,wants:string[],haves:string[],depth?:number,shallow:string[]=[]){const all=closure(store,wants,depth).objects,known=new Set<string>();for(const h of haves)for(const id of closure(store,[h],undefined,shallow).objects.keys())known.add(id);for(const id of known)all.delete(id);return all;}
 const packedCache=new ByteCache<string,Buffer>(24*1024*1024);
-function packedWant(store:RepoStore,wants:string[],haves:string[],depth?:number,shallow:string[]=[]){const effectiveShallow=depth===1?[]:shallow;const key=store.path+'|'+wants.join(',')+'|'+haves.join(',')+'|'+String(depth??0)+'|'+effectiveShallow.join(',');const cached=packedCache.get(key);if(cached)return cached;const packed=writePack(packWant(store,wants,haves,depth,effectiveShallow).values());if(packed.length<=4*1024*1024)packedCache.set(key,packed,packed.buffer.byteLength);return packed;}
+const packSnapshots=new WeakMap<Map<string,string>,{version:number; id:number}>();
+let nextPackSnapshot=0;
+function packedReply(store:RepoStore,wants:string[],haves:string[],depth:number|undefined,shallow:string[],v2:boolean){
+  const refs=store.refs(), version=store.advertisementVersion();
+  let snapshot=packSnapshots.get(refs);
+  if(snapshot?.version!==version){
+    snapshot={version,id:++nextPackSnapshot};
+    packSnapshots.set(refs,snapshot);
+  }
+  // A new snapshot invalidates every previous key for this repo. The shared LRU
+  // bounds memory even when many repositories have cached responses.
+  wants.sort();haves.sort();shallow.sort();
+  const key=JSON.stringify([snapshot.id,v2,String(depth),wants,haves,shallow]);
+  const cached=packedCache.get(key);
+  if(cached)return cached;
+  const {objects,boundaries}=closure(store,wants,depth);
+  const effectiveShallow=depth===1?[]:shallow;
+  for(const oid of closure(store,haves,undefined,effectiveShallow).objects.keys())objects.delete(oid);
+  const prefix:Buffer[]=[];
+  if(depth){
+    if(v2)prefix.push(pkt('shallow-info\n'));
+    for(const oid of boundaries)prefix.push(pkt(`shallow ${oid}\n`));
+    if(v2)prefix.push(FLUSH);
+  }
+  prefix.push(v2?PACKFILE:NAK);
+  const reply=framePack(prefix,writePack(objects.values()));
+  if(reply.length<=4*1024*1024)packedCache.set(key,reply,reply.buffer.byteLength);
+  return reply;
+}
 function lsRefs(store:RepoStore,lines:string[]){const sym=lines.includes('symrefs\n'),peeling=lines.includes('peel\n'),prefix=lines.filter(x=>x.startsWith('ref-prefix ')).map(x=>x.slice(11).trim());const refs=refList(store).filter(([n])=>!prefix.length||prefix.some(p=>n.startsWith(p)));const out:Buffer[]=[];for(const [name,oid] of refs){if(name==='HEAD'&&oid===ZERO&&!store.head().oid){if(lines.includes('unborn\n'))out.push(pkt(`unborn HEAD symref-target:${store.head().target??'refs/heads/main'}\n`));continue;}let extra=name==='HEAD'&&sym?` symref-target:${store.head().target??'refs/heads/main'}`:'';if(peeling&&name.startsWith('refs/tags/')){const target=peel(store,oid);if(target&&target!==oid)extra+=` peeled:${target}`;}out.push(pkt(`${oid} ${name}${extra}\n`));}return Buffer.concat([...out,flush()]);}
-async function upload(req:IncomingMessage,res:ServerResponse,store:RepoStore){const buffered=(req as IncomingMessage&{__rawBody?:Buffer}).__rawBody,b=Buffer.isBuffer(buffered)?buffered:await readBytes(req);const {out,p}=decodePackets(b);const lines=out.map(x=>x.toString());const v2=req.headers['git-protocol']==='version=2';if(v2){const command=lines.find(x=>x.startsWith('command='))?.slice(8).trim()??'';const args=lines.filter(x=>!x.startsWith('command=')&&!x.startsWith('agent=')&&!x.startsWith('object-format='));if(command==='ls-refs'){gitReply(res,'application/x-git-upload-pack-result',lsRefs(store,args));return;}if(command==='fetch'){const wants=args.filter(x=>x.startsWith('want ')).map(x=>x.slice(5).trim()),haves=args.filter(x=>x.startsWith('have ')).map(x=>x.slice(5).trim()),depthLine=args.find(x=>x.startsWith('deepen ')),depth=depthLine?Number(depthLine.slice(7)):undefined,shallow=args.filter(x=>x.startsWith('shallow ')).map(x=>x.slice(8).trim());const bounds=depth?closure(store,wants,depth).boundaries:[];const parts:Buffer[]=[];if(depth){parts.push(pkt('shallow-info\n'));for(const id of bounds)parts.push(pkt(`shallow ${id}\n`));parts.push(flush());}const packed=packedWant(store,wants,haves,depth,shallow);if(packed.length)parts.push(PACKFILE);const pending=replyPack(res,parts,packed);if(pending)await pending;return;}}
-  const wants=lines.filter(x=>x.startsWith('want ')).map(x=>x.slice(5).trim().split(' ')[0]!);const haves=lines.filter(x=>x.startsWith('have ')).map(x=>x.slice(5).trim());const dep=lines.find(x=>x.startsWith('deepen ')),depth=dep?Number(dep.slice(7)):undefined;const shallow=lines.filter(x=>x.startsWith('shallow ')).map(x=>x.slice(8).trim());const bounds=depth?closure(store,wants,depth).boundaries:[],pck=packedWant(store,wants,haves,depth,shallow);const parts:Buffer[]=[];for(const id of bounds)parts.push(pkt(`shallow ${id}\n`));parts.push(NAK);const pending=replyPack(res,parts,pck);if(pending)await pending;}
+async function upload(req:IncomingMessage,res:ServerResponse,store:RepoStore){const buffered=(req as IncomingMessage&{__rawBody?:Buffer}).__rawBody,b=Buffer.isBuffer(buffered)?buffered:await readBytes(req);const {out,p}=decodePackets(b);const lines=out.map(x=>x.toString());const v2=req.headers['git-protocol']==='version=2';if(v2){const command=lines.find(x=>x.startsWith('command='))?.slice(8).trim()??'';const args=lines.filter(x=>!x.startsWith('command=')&&!x.startsWith('agent=')&&!x.startsWith('object-format='));if(command==='ls-refs'){gitReply(res,'application/x-git-upload-pack-result',lsRefs(store,args));return;}if(command==='fetch'){const wants=args.filter(x=>x.startsWith('want ')).map(x=>x.slice(5).trim()),haves=args.filter(x=>x.startsWith('have ')).map(x=>x.slice(5).trim()),depthLine=args.find(x=>x.startsWith('deepen ')),depth=depthLine?Number(depthLine.slice(7)):undefined,shallow=args.filter(x=>x.startsWith('shallow ')).map(x=>x.slice(8).trim());gitReply(res,UPLOAD_RESULT,packedReply(store,wants,haves,depth,shallow,true));return;}}
+  const wants=lines.filter(x=>x.startsWith('want ')).map(x=>x.slice(5).trim().split(' ')[0]!);const haves=lines.filter(x=>x.startsWith('have ')).map(x=>x.slice(5).trim());const dep=lines.find(x=>x.startsWith('deepen ')),depth=dep?Number(dep.slice(7)):undefined;const shallow=lines.filter(x=>x.startsWith('shallow ')).map(x=>x.slice(8).trim());gitReply(res,UPLOAD_RESULT,packedReply(store,wants,haves,depth,shallow,false));}
 async function receive(req:IncomingMessage,res:ServerResponse,store:RepoStore){const buffered=(req as IncomingMessage&{__rawBody?:Buffer}).__rawBody,b=Buffer.isBuffer(buffered)?buffered:await readBytes(req);const {out,p}=decodePackets(b);const commands:{old:string;next:string;ref:string}[]=[];for(const payload of out){const text=payload.toString();if(!text.trim())continue;const [old,next,ref]=text.split('\0',1)[0]!.trim().split(/\s+/);if(old&&next&&ref)commands.push({old,next,ref});}const pack=b.subarray(p);let objects=new Map<string,GitObject>();let unpack='ok';if(pack.length){try{objects=readPack(pack,oid=>store.object(oid));store.storeVerifiedObjects(objects);}catch(e){unpack=(e as Error).message;}}
   const result:string[]=[`unpack ${unpack}\n`];for(const c of commands){const oldNow=store.refs().get(c.ref)??ZERO;let reason='';if(unpack!=='ok')reason='unpack failed';else if(oldNow!==c.old)reason='stale info';else if(c.next===ZERO){if(oldNow===ZERO)reason='reference does not exist';else store.setRef(c.ref,null);}else if(c.old!==ZERO&&!store.isAncestor(c.old,c.next))reason='non-fast-forward';else if(!store.object(c.next))reason='missing object';else store.setRef(c.ref,c.next);result.push(reason?`ng ${c.ref} ${reason}\n`:`ok ${c.ref}\n`);}const report=result.map(pkt);const size=report.reduce((n,part)=>n+part.length,9);const side=Buffer.concat([Buffer.from(size.toString(16).padStart(4,'0')+'\x01'),...report,FLUSH,FLUSH],size+4);gitReply(res,'application/x-git-receive-pack-result',side);}
 export async function handleGit(req:IncomingMessage,res:ServerResponse,owner:string,repo:string,service:string,action:'info'|'upload'|'receive',store:RepoStore):Promise<void>{if(!store.exists()){json(res,404,{message:'Not Found'});return;}try{if(action==='info'){if(service!=='git-upload-pack'&&service!=='git-receive-pack'){json(res,400,{message:'Invalid service'});return;}if(service==='git-receive-pack'&&req.headers['git-protocol']==='version=2'){json(res,400,{message:'Protocol v2 receive-pack is unsupported'});return;}const b=service==='git-upload-pack'&&req.headers['git-protocol']==='version=2'?v2Advertisement():v0Advertisement(store,service);gitReply(res,service==='git-upload-pack'?'application/x-git-upload-pack-advertisement':'application/x-git-receive-pack-advertisement',b);return;}if(action==='upload')await upload(req,res,store);else await receive(req,res,store);}catch(error){if(res.headersSent){res.destroy();return;}const io=!!(error as NodeJS.ErrnoException).code;json(res,io?500:400,{message:io?'Git storage error':'Malformed git request'});}}
