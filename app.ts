@@ -1,4 +1,3 @@
-import { readBytes } from './src/http-body.ts';
 import { createHash } from 'node:crypto';
 import { ByteCache } from './src/cache.ts';
 import { initializeStore } from './src/store-root.ts';
@@ -9,34 +8,55 @@ import { handleGit } from './src/git-http.ts';
 import { executeGraphQL } from './src/graphql.ts';
 import { handleMcp } from './src/mcp.ts';
 
+const EMPTY_BODY = Buffer.alloc(0);
 const JSON_TYPE = 'application/json; charset=utf-8';
 const VIEWER = 'adaiversen';
 type AnyObj = Record<string, any>;
 type FileEntry = { sha: string; data: Buffer };
-type RepoMeta = { id: number; owner: string; name: string; description: string; private: boolean; default_branch: string; labels: Map<string, AnyObj>; issues: Map<number, AnyObj>; pulls: Map<number, AnyObj>; };
+type RepoMeta = { id: number; version: number; owner: string; name: string; description: string; private: boolean; default_branch: string; labels: Map<string, AnyObj>; issues: Map<number, AnyObj>; pulls: Map<number, AnyObj>; };
 const repositories = new Map<string, RepoMeta>();
 const existingRepoCache = new WeakSet<RepoMeta>();
 let issueNumber = 0, commentId = 0;
-const issueJsonCache = new ByteCache<object, { text: string; length: number }>(4*1024*1024);
+type ReadFrame = { repo: RepoMeta; version: number; frame: Buffer };
+const gitAdvertisementFrames = new WeakMap<Buffer, Buffer>();
+const readFrames = new ByteCache<string, ReadFrame>(8 * 1024 * 1024);
+let authorization: string | undefined;
+function viewerFor(header: unknown) { return authorization && header === authorization ? VIEWER : undefined; }
+
+const jsonOkHead = 'HTTP/1.1 200 OK\r\ncontent-type: ' + JSON_TYPE + '\r\ncontent-length: ';
+const jsonCreatedHead = 'HTTP/1.1 201 Created\r\ncontent-type: ' + JSON_TYPE + '\r\ncontent-length: ';
+function jsonFrame(status: number, text: string, keepAlive: boolean): Buffer {
+  return Buffer.from((status === 200 ? jsonOkHead : jsonCreatedHead) + Buffer.byteLength(text) +
+    '\r\nx-github-request-id: ' + reqId() + '\r\nconnection: ' +
+    (keepAlive ? 'keep-alive' : 'close') + '\r\n\r\n' + text);
+}
+
+function sendRead(req: IncomingMessage, res: ServerResponse, repo: RepoMeta, body: unknown) {
+  const raw = res as unknown as RawResponse;
+  const target = req.url!;
+  const frame = jsonFrame(200, JSON.stringify(body) + '\n', raw.keepAlive);
+  if (raw.keepAlive) readFrames.set(target, { repo, version: repo.version, frame }, frame.buffer.byteLength);
+  raw.endFrame(frame);
+}
+
 const keyOf = (o: string, r: string) => `${o.toLowerCase()}/${r.toLowerCase()}`;
 let requestSequence = 0;
 // The protocol only requires a non-empty request id. A monotonic value avoids a synchronous crypto
-// call on every hot REST response while remaining unique for this server process.
+// call when building a response. Cached frames retain the ID assigned at build time.
 const reqId = () => (++requestSequence).toString(16).padStart(12, '0').toUpperCase();
 const jsonHeaders: (string | number)[] = ['content-type', JSON_TYPE, 'content-length', 0, 'x-github-request-id', ''];
-function sendJson(res: ServerResponse, status: number, body: unknown, headers?: Record<string,string>, cache?: ByteCache<object,{ text: string; length: number }>) {
+function sendJson(res: ServerResponse, status: number, body: unknown, headers?: Record<string,string>) {
   const rid = reqId();
   if (status === 204) { res.writeHead(status, { 'content-type': JSON_TYPE, 'x-github-request-id': rid, ...headers }); res.end(); return; }
-  let cached = body !== null && typeof body === 'object' ? cache?.get(body) : undefined;
-  if (cached === undefined) { const text = `${JSON.stringify(body)}\n`; cached = { text, length: Buffer.byteLength(text) }; if (body !== null && typeof body === 'object') cache?.set(body, cached, cached.length); }
-  jsonHeaders[3] = cached.length;
+  const text = JSON.stringify(body) + '\n';
+  jsonHeaders[3] = Buffer.byteLength(text);
   jsonHeaders[5] = rid;
-  res.writeHead(status, headers ? { 'content-type': JSON_TYPE, 'content-length': cached.length, 'x-github-request-id': rid, ...headers } : jsonHeaders);
-  res.end(cached.text);
+  res.writeHead(status, headers ? { 'content-type': JSON_TYPE, 'content-length': jsonHeaders[3], 'x-github-request-id': rid, ...headers } : jsonHeaders);
+  res.end(text);
 }
 function pathOf(req: IncomingMessage): string { const raw=req.url??'/'; if(!raw.startsWith('/')||raw.includes('\\')||raw.includes('/.')||/[\r\n\t]/.test(raw)){try{return new URL(raw,'http://entry').pathname;}catch{return '/';}} const end=raw.indexOf('?');const path=end<0?raw:raw.slice(0,end);const hash=path.indexOf('#');return hash<0?path:path.slice(0,hash); }
-async function readBody(req: IncomingMessage): Promise<AnyObj> {
-  const raw = (await readBytes(req)).toString('utf8');
+function readBody(req: IncomingMessage): AnyObj {
+  const raw = (req as unknown as BufferedRequest).__rawBody.toString('utf8');
   if (!raw) throw new Error('Invalid JSON');
   const value = JSON.parse(raw); if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('Invalid JSON');
   return value;
@@ -105,6 +125,7 @@ async function graphql(req: IncomingMessage, res: ServerResponse): Promise<void>
       return [...after.keys()].filter(path=>before.get(path)?.sha!==after.get(path)?.sha).concat([...before.keys()].filter(path=>!after.has(path)));
     },
     mergePull:(meta,pull)=>mergePullForGraphQL(meta as RepoMeta,pull),
+    invalidateIssueReads: (repo) => ++(repo as RepoMeta).version,
     nextIssueNumber:()=>++issueNumber,
     nextCommentId:()=>++commentId,
   });
@@ -113,16 +134,16 @@ async function graphql(req: IncomingMessage, res: ServerResponse): Promise<void>
 
 async function rest(req:IncomingMessage,res:ServerResponse):Promise<void>{
   const url=new URL(req.url??'/', 'http://entry'), path=url.pathname, method=req.method??'GET';
-  const parts=path.split('/').filter(Boolean); const token=process.env.MAKEFUN_SHOP_TOKEN??'';
-  if((path==='/api/v3'||path.startsWith('/api/v3/')) && (!token||req.headers.authorization!==`Bearer ${token}`)){sendJson(res,401,{message:'Bad credentials'});return;}
+  const parts=path.split('/').filter(Boolean);
+  if((path==='/api/v3'||path.startsWith('/api/v3/')) && !viewerFor(req.headers.authorization)){sendJson(res,401,{message:'Bad credentials'});return;}
   if(method==='GET'&&(path==='/api/v3'||path==='/api/v3/')){sendJson(res,200,{current_user_url:'/api/v3/user',rate_limit_url:'/api/v3/rate_limit'},{'x-oauth-scopes':'repo, read:org'});return;}
   if(method==='GET'&&path==='/api/v3/meta'){sendJson(res,200,{installed_version:'3.0.0'});return;}
   if(method==='POST'&&path==='/api/v3/user/repos'){
-    let b:AnyObj;try{b=await readBody(req);}catch{sendJson(res,400,{message:'Invalid JSON'});return;}
+    let b:AnyObj;try{b=readBody(req);}catch{sendJson(res,400,{message:'Invalid JSON'});return;}
     if(typeof b.name!=='string'||!/^[A-Za-z0-9_.-]+$/.test(b.name)){sendJson(res,422,{message:'Validation Failed'});return;}
     const owner=VIEWER,name=b.name,key=keyOf(owner,name);if(repository(owner,name)){sendJson(res,422,{message:'Repository already exists'});return;}
-    const meta:RepoMeta={id:repositories.size+1,owner,name,description:typeof b.description==='string'?b.description:'',private:b.private!==false,default_branch:typeof b.default_branch==='string'?b.default_branch:'main',labels:new Map(),issues:new Map(),pulls:new Map()};
-    new RepoStore(owner,name).create();repositories.set(key,meta);sendJson(res,201,{id:repositories.size,name,full_name:`${owner}/${name}`,owner:{login:owner},private:meta.private,default_branch:meta.default_branch,description:meta.description});return;
+    const meta:RepoMeta={id:repositories.size+1,version:0,owner,name,description:typeof b.description==='string'?b.description:'',private:b.private!==false,default_branch:typeof b.default_branch==='string'?b.default_branch:'main',labels:new Map(),issues:new Map(),pulls:new Map()};
+    new RepoStore(owner,name).create(() => ++meta.version);repositories.set(key,meta);sendJson(res,201,{id:repositories.size,name,full_name:`${owner}/${name}`,owner:{login:owner},private:meta.private,default_branch:meta.default_branch,description:meta.description});return;
   }
   if(method==='GET'&&path==='/api/v3/user/repos'){
     const all=[...repositories.values()].filter(r=>r.owner.toLowerCase()===VIEWER).sort((a,b)=>a.name.localeCompare(b.name));const per=Math.max(1,Math.min(100,Number(url.searchParams.get('per_page'))||30)),page=Math.max(1,Number(url.searchParams.get('page'))||1),start=(page-1)*per,items=all.slice(start,start+per).map(r=>repoJson(r));const headers:Record<string,string>={};if(start+per<all.length){const origin=`${url.protocol}//${req.headers.host??'localhost'}`,next=new URL(path,origin);next.searchParams.set('per_page',String(per));next.searchParams.set('page',String(page+1));headers.link=`<${next.toString()}>; rel="next"`;}sendJson(res,200,items,headers);return;
@@ -136,14 +157,14 @@ async function rest(req:IncomingMessage,res:ServerResponse):Promise<void>{
     if(!meta||owner.toLowerCase()!==VIEWER){notFound(res);return;}
     const tail=parts.slice(5).map(decodeURIComponent), base=`/api/v3/repos/${encodeURIComponent(owner)}/${encodeURIComponent(name)}`;
     if(tail.length===0){
-      if(method==='GET'){sendJson(res,200,repoJson(meta));return;}
-      if(method==='PATCH'){let b:AnyObj;try{b=await readBody(req);}catch{sendJson(res,400,{message:'Invalid JSON'});return;}if(typeof b.description==='string')meta.description=b.description;if(typeof b.private==='boolean')meta.private=b.private;sendJson(res,200,repoJson(meta));return;}
-      if(method==='DELETE'){repoStore(meta).remove();repositories.delete(keyOf(owner,name));sendJson(res,204,null);return;}
+      if(method==='GET'){sendRead(req,res,meta,repoJson(meta));return;}
+      if(method==='PATCH'){let b:AnyObj;try{b=readBody(req);}catch{sendJson(res,400,{message:'Invalid JSON'});return;}if(typeof b.description==='string')meta.description=b.description;if(typeof b.private==='boolean')meta.private=b.private;meta.version++;sendJson(res,200,repoJson(meta));return;}
+      if(method==='DELETE'){repoStore(meta).remove();repositories.delete(keyOf(owner,name));meta.version++;sendJson(res,204,null);return;}
     }
     if(tail[0]==='git'&&tail[1]==='refs'&&method==='POST'){
-      let b:AnyObj;try{b=await readBody(req);}catch{sendJson(res,400,{message:'Invalid JSON'});return;}const ref=String(b.ref??''),sha=String(b.sha??'');if(!ref.startsWith('refs/heads/')||repoStore(meta).object(sha)?.type!=='commit'){sendJson(res,422,{message:'Invalid ref'});return;}repoStore(meta).setRef(ref,sha);sendJson(res,201,{ref,object:{sha}});return;
+      let b:AnyObj;try{b=readBody(req);}catch{sendJson(res,400,{message:'Invalid JSON'});return;}const ref=String(b.ref??''),sha=String(b.sha??'');if(!ref.startsWith('refs/heads/')||repoStore(meta).object(sha)?.type!=='commit'){sendJson(res,422,{message:'Invalid ref'});return;}repoStore(meta).setRef(ref,sha);sendJson(res,201,{ref,object:{sha}});return;
     }
-    if(tail[0]==='branches'&&method==='GET'){const refs=repoStore(meta).refs();sendJson(res,200,[...refs].filter(([r])=>r.startsWith('refs/heads/')).map(([r,sha])=>({name:r.slice(11),commit:{sha}})));return;}
+    if(tail[0]==='branches'&&method==='GET'){const refs=repoStore(meta).refs();sendRead(req,res,meta,[...refs].filter(([r])=>r.startsWith('refs/heads/')).map(([r,sha])=>({name:r.slice(11),commit:{sha}})));return;}
     if(tail[0]==='commits'&&method==='GET'){
       const store=repoStore(meta),tip=resolveCommit(meta,url.searchParams.get('sha')??undefined);const out:AnyObj[]=[],seen=new Set<string>();let cur=tip;while(cur&&!seen.has(cur)){seen.add(cur);const info=commitInfo(store,cur);if(info)out.push(info);const c=store.object(cur);if(!c)break;const p=/^parent ([0-9a-f]{40})/m.exec(c.data.toString());cur=p?.[1];}sendJson(res,200,out);return;
     }
@@ -153,7 +174,7 @@ async function rest(req:IncomingMessage,res:ServerResponse):Promise<void>{
         if(old){sendJson(res,200,{name:filePath.split('/').pop(),path:filePath,sha:old.sha,size:old.data.length,type:'file',encoding:'base64',content:old.data.toString('base64')});return;}
         const prefix=filePath.replace(/\/$/,'')+'/';const children=new Map<string,{dir:boolean;entry:FileEntry}>();for(const [p,e] of files){if(!p.startsWith(prefix))continue;const rest=p.slice(prefix.length),segment=rest.split('/')[0]!;children.set(segment,{dir:rest.includes('/'),entry:e});}if(children.size){sendJson(res,200,[...children].map(([name,x])=>({name,path:`${prefix}${name}`,sha:x.entry.sha,type:x.dir?'dir':'file'})));return;}notFound(res);return;
       }
-      let b:AnyObj;try{b=await readBody(req);}catch{sendJson(res,400,{message:'Invalid JSON'});return;}
+      let b:AnyObj;try{b=readBody(req);}catch{sendJson(res,400,{message:'Invalid JSON'});return;}
       const branch=String(b.branch??meta.default_branch),branchTip=resolveCommit(meta,branch);const branchFiles=filesAt(meta,branchTip);const current=branchFiles.get(filePath);
       if(method==='PUT'){
         if(current&&(!b.sha||String(b.sha)!==current.sha)){sendJson(res,409,{message:'Conflict: sha does not match'});return;}if(!current&&b.sha){sendJson(res,409,{message:'Conflict: file does not exist'});return;}
@@ -162,25 +183,25 @@ async function rest(req:IncomingMessage,res:ServerResponse):Promise<void>{
       if(!current){notFound(res);return;}if(!b.sha||String(b.sha)!==current.sha){sendJson(res,409,{message:'Conflict: sha does not match'});return;}branchFiles.delete(filePath);const result=commitTree(meta,branchFiles,String(b.message??'Delete file'),branch,branchTip);sendJson(res,200,{commit:{sha:result.commitSha}});return;
     }
     if(tail[0]==='labels'&&method==='POST'){
-      let b:AnyObj;try{b=await readBody(req);}catch{sendJson(res,400,{message:'Invalid JSON'});return;}if(typeof b.name!=='string'||!b.name){sendJson(res,422,{message:'Validation Failed'});return;}const label={id:meta.labels.size+1,name:b.name,color:String(b.color??'ededed'),description:''};meta.labels.set(b.name.toLowerCase(),label);sendJson(res,201,label);return;
+      let b:AnyObj;try{b=readBody(req);}catch{sendJson(res,400,{message:'Invalid JSON'});return;}if(typeof b.name!=='string'||!b.name){sendJson(res,422,{message:'Validation Failed'});return;}const label={id:meta.labels.size+1,name:b.name,color:String(b.color??'ededed'),description:''};meta.labels.set(b.name.toLowerCase(),label);sendJson(res,201,label);return;
     }
     if(tail[0]==='issues'){
-      if(tail.length===1&&method==='GET'){const state=url.searchParams.get('state')??'open',direction=url.searchParams.get('direction')==='asc'?1:-1;const list=[...meta.issues.values()].filter(i=>state==='all'||i.state===state).sort((a,b)=>(a.number-b.number)*direction);sendJson(res,200,list);return;}
+      if(tail.length===1&&method==='GET'){const state=url.searchParams.get('state')??'open',direction=url.searchParams.get('direction')==='asc'?1:-1;const list=[...meta.issues.values()].filter(i=>state==='all'||i.state===state).sort((a,b)=>(a.number-b.number)*direction);sendRead(req,res,meta,list);return;}
       if(tail.length===1&&method==='POST'){
-        let b:AnyObj;try{b=await readBody(req);}catch{sendJson(res,400,{message:'Invalid JSON'});return;}const labels:AnyObj[]=[];
+        let b:AnyObj;try{b=readBody(req);}catch{sendJson(res,400,{message:'Invalid JSON'});return;}const labels:AnyObj[]=[];
         if(Array.isArray(b.labels)) for(const entry of b.labels){
           const name=typeof entry==='string'?entry:String(entry?.name??'');
           const label=meta.labels.get(name.toLowerCase());
           if(!label){sendJson(res,422,{message:'Validation Failed'});return;}
           labels.push(label);
         }
-        const number=++issueNumber,issue={id:number,number,title:String(b.title??''),body:String(b.body??''),state:'open',labels,created_at:new Date().toISOString()};meta.issues.set(issue.number,issue);sendJson(res,201,issue);return;
+        const number=++issueNumber,issue={id:number,number,title:String(b.title??''),body:String(b.body??''),state:'open',labels,created_at:new Date().toISOString()};meta.issues.set(issue.number,issue);meta.version++;(res as unknown as RawResponse).endFrame(jsonFrame(201, JSON.stringify(issue) + "\n", (res as unknown as RawResponse).keepAlive));return;
       }
       const n=Number(tail[1]);const issue=getIssue(meta,n);if(!Number.isInteger(n)||!issue){notFound(res);return;}
-      if(tail.length===2&&method==='GET'){sendJson(res,200,issue,undefined,issueJsonCache);return;}
-      if(tail.length===2&&method==='PATCH'){let b:AnyObj;try{b=await readBody(req);}catch{sendJson(res,400,{message:'Invalid JSON'});return;}if(b.state==='closed'||b.state==='open')issue.state=b.state;issueJsonCache.delete(issue);sendJson(res,200,issue);return;}
+      if(tail.length===2&&method==='GET'){sendRead(req,res,meta,issue);return;}
+      if(tail.length===2&&method==='PATCH'){let b:AnyObj;try{b=readBody(req);}catch{sendJson(res,400,{message:'Invalid JSON'});return;}if(b.state==='closed'||b.state==='open')issue.state=b.state;meta.version++;sendJson(res,200,issue);return;}
       if(tail[2]==='comments'){
-        if(method==='POST'){let b:AnyObj;try{b=await readBody(req);}catch{sendJson(res,400,{message:'Invalid JSON'});return;}const c={id:++commentId,body:String(b.body??'')};(issue.comments??=[]).push(c);issueJsonCache.delete(issue);sendJson(res,201,c);return;}
+        if(method==='POST'){let b:AnyObj;try{b=readBody(req);}catch{sendJson(res,400,{message:'Invalid JSON'});return;}const c={id:++commentId,body:String(b.body??'')};(issue.comments??=[]).push(c);meta.version++;sendJson(res,201,c);return;}
         if(method==='GET'){sendJson(res,200,issue.comments??[]);return;}
       }
       notFound(res);return;
@@ -188,7 +209,7 @@ async function rest(req:IncomingMessage,res:ServerResponse):Promise<void>{
     if(tail[0]==='pulls'){
       if(tail.length===1&&method==='GET'){const state=url.searchParams.get('state')??'open';sendJson(res,200,[...meta.pulls.values()].filter(p=>state==='all'||p.state===state));return;}
       if(tail.length===1&&method==='POST'){
-        let b:AnyObj;try{b=await readBody(req);}catch{sendJson(res,400,{message:'Invalid JSON'});return;}const headRef=String(b.head??''),baseRef=String(b.base??meta.default_branch),store=repoStore(meta),headSha=resolveCommit(meta,headRef),baseSha=resolveCommit(meta,baseRef);if(!headSha||!baseSha){sendJson(res,422,{message:'Validation Failed'});return;}const pull={number:meta.pulls.size+1,state:'open',title:String(b.title??''),body:String(b.body??''),head:{label:`${owner}:${headRef}`,ref:headRef,sha:headSha,repo:{name}},base:{label:`${owner}:${baseRef}`,ref:baseRef,sha:baseSha,repo:{name}},created_at:new Date().toISOString(),merged:false,merged_at:null,merge_commit_sha:null,base_sha:baseSha,head_sha:headSha};meta.pulls.set(pull.number,pull);sendJson(res,201,pull);return;
+        let b:AnyObj;try{b=readBody(req);}catch{sendJson(res,400,{message:'Invalid JSON'});return;}const headRef=String(b.head??''),baseRef=String(b.base??meta.default_branch),store=repoStore(meta),headSha=resolveCommit(meta,headRef),baseSha=resolveCommit(meta,baseRef);if(!headSha||!baseSha){sendJson(res,422,{message:'Validation Failed'});return;}const pull={number:meta.pulls.size+1,state:'open',title:String(b.title??''),body:String(b.body??''),head:{label:`${owner}:${headRef}`,ref:headRef,sha:headSha,repo:{name}},base:{label:`${owner}:${baseRef}`,ref:baseRef,sha:baseSha,repo:{name}},created_at:new Date().toISOString(),merged:false,merged_at:null,merge_commit_sha:null,base_sha:baseSha,head_sha:headSha};meta.pulls.set(pull.number,pull);sendJson(res,201,pull);return;
       }
       const n=Number(tail[1]),pull=meta.pulls.get(n);if(!Number.isInteger(n)||!pull){notFound(res);return;}
       if(tail[2]==='files'&&method==='GET'){const before=filesAt(meta,pull.base_sha),after=filesAt(meta,pull.head_sha),changed:AnyObj[]=[];for(const [p,f] of after){const prior=before.get(p);if(prior?.sha===f.sha)continue;const lines=Math.max(1,f.data.toString('utf8').split(/\r?\n/).filter(Boolean).length);changed.push({filename:p,status:prior?'modified':'added',additions:lines,deletions:0,changes:lines,sha:f.sha,contents_url:`${base}/contents/${p}`});}for(const [p,f] of before)if(!after.has(p))changed.push({filename:p,status:'removed',additions:0,deletions:Math.max(1,f.data.toString('utf8').split(/\r?\n/).filter(Boolean).length),changes:Math.max(1,f.data.toString('utf8').split(/\r?\n/).filter(Boolean).length)});sendJson(res,200,changed);return;}
@@ -211,11 +232,12 @@ function repoJson(r:RepoMeta){return {id:r.id,name:r.name,full_name:`${r.owner}/
 const TOKEN_SPECIALS = "!#$%&'*+-.^_`|~";
 function isToken(value:string):boolean{for(let i=0;i<value.length;i++){const c=value.charCodeAt(i);if(!((c>=48&&c<=57)||(c>=65&&c<=90)||(c>=97&&c<=122)||TOKEN_SPECIALS.includes(value[i]!)))return false;}return value.length>0;}
 function hasInvalidControl(value:string,allowTab=false):boolean{for(let i=0;i<value.length;i++){const c=value.charCodeAt(i);if(c===127||(c<32&&!(allowTab&&c===9)))return true;}return false;}
-function parseHead(buffer: Buffer, end: number): { method: string; target: string; version: string; headers: Record<string, string>; bodyOffset: number } {
+type HeaderMemo = { bytes?: Buffer; headers?: Record<string, string> };
+function parseHead(buffer: Buffer, end: number, memo: HeaderMemo): { method: string; target: string; version: string; headers: Record<string, string>; bodyOffset: number } {
  const lineEnd=buffer.indexOf('\r\n');if(lineEnd<0||lineEnd>=end)throw new Error('Bad request');
  const requestLine=buffer.toString('ascii',0,lineEnd),firstSpace=requestLine.indexOf(' '),lastSpace=requestLine.lastIndexOf(' ');
- if(firstSpace<=0||lastSpace<=firstSpace)throw new Error('Bad request');
- const method=requestLine.slice(0,firstSpace),rawTarget=requestLine.slice(firstSpace+1,lastSpace),version=requestLine.slice(lastSpace+1);
+ if(firstSpace<=0||firstSpace>=lineEnd||lastSpace<=firstSpace)throw new Error('Bad request');
+ const method=firstSpace===3&&requestLine.startsWith('GET ')?'GET':requestLine.slice(0,firstSpace),rawTarget=requestLine.slice(firstSpace+1,lastSpace),version=requestLine.slice(lastSpace+1);
  if(!isToken(method)||!rawTarget||hasInvalidControl(rawTarget)||!(version==='HTTP/1.1'||version==='HTTP/1.0'))throw new Error('Bad request');
  // Proxies may send absolute-form targets. Convert them to the origin-form URL used by
  // the handlers while preserving the query string (which carries Git service selection).
@@ -226,8 +248,14 @@ function parseHead(buffer: Buffer, end: number): { method: string; target: strin
   if((absolute.protocol!=='http:'&&absolute.protocol!=='https:')||!absolute.hostname)throw new Error('Bad request');
   target=`${absolute.pathname||'/'}${absolute.search}`;
  }
- const headers:Record<string,string>={};let pos=lineEnd+2;
+ const firstHeader = lineEnd + 2;
+ const bytes = buffer.subarray(firstHeader, end);
+ if (memo.headers && memo.bytes!.equals(bytes)) {
+  return {method,target,version,headers:memo.headers,bodyOffset:end+4};
+ }
+ const headers:Record<string,string>={};let pos=firstHeader;
  while(pos<end){const lineEndAt=buffer.indexOf('\r\n',pos);if(lineEndAt<0||lineEndAt>end)throw new Error('Bad request');const colon=buffer.indexOf(':',pos);if(colon<0||colon>=lineEndAt||colon===pos)throw new Error('Bad header');const name=buffer.toString('ascii',pos,colon).toLowerCase();let value=buffer.toString('latin1',colon+1,lineEndAt).trim();if(!isToken(name)||hasInvalidControl(value,true))throw new Error('Bad header');if(headers[name]!==undefined)headers[name]=name==='cookie'?`${headers[name]}; ${value}`:`${headers[name]}, ${value}`;else headers[name]=value;pos=lineEndAt+2;}
+ if (bytes.length <= 4096) { memo.bytes = Buffer.from(bytes); memo.headers = headers; }
  return {method,target,version,headers,bodyOffset:end+4};
 }
 function parseRequestBody(buffer:Buffer,head:ReturnType<typeof parseHead>):{body:Buffer;consumed:number}|undefined {
@@ -246,11 +274,11 @@ function parseRequestBody(buffer:Buffer,head:ReturnType<typeof parseHead>):{body
    if(buffer.length<pos+size+2)return;if(buffer[pos+size]!==13||buffer[pos+size+1]!==10)throw new Error('Bad chunk');chunks.push(buffer.subarray(pos,pos+size));total+=size;pos+=size+2;
   }
  }
- const rawLength=head.headers['content-length'];if(rawLength===undefined)return {body:Buffer.alloc(0),consumed:head.bodyOffset};if(!/^[0-9]+$/.test(rawLength))throw new Error('Bad length');const length=Number(rawLength);if(!Number.isSafeInteger(length)||length<0)throw new Error('Bad length');if(buffer.length<head.bodyOffset+length)return;return {body:buffer.subarray(head.bodyOffset,head.bodyOffset+length),consumed:head.bodyOffset+length};
+ const rawLength=head.headers['content-length'];if(rawLength===undefined)return {body:EMPTY_BODY,consumed:head.bodyOffset};if(!/^[0-9]+$/.test(rawLength))throw new Error('Bad length');const length=Number(rawLength);if(!Number.isSafeInteger(length)||length<0)throw new Error('Bad length');if(buffer.length<head.bodyOffset+length)return;return {body:buffer.subarray(head.bodyOffset,head.bodyOffset+length),consumed:head.bodyOffset+length};
 }
 class RawResponse {
  status=200;headers:Record<string,string|string[]>={};headersSent=false;finished=false;private chunks:Buffer[]=[];private size=0;private complete!:()=>void;done:Promise<void>;
- socket:Socket;private method:string;private keepAlive:boolean;
+ socket:Socket;private method:string;readonly keepAlive:boolean;
  constructor(socket:Socket,method:string,keepAlive:boolean){this.socket=socket;this.method=method;this.keepAlive=keepAlive;this.done=new Promise(resolve=>{this.complete=resolve;});}
  writeHead(status:number,headers?:any):this {
   this.status=status;this.headersSent=true;let values=headers;if(Array.isArray(values)){const mapped:Record<string,string|string[]>={};for(let i=0;i<values.length;i+=2){const key=String(values[i]).toLowerCase(),value=String(values[i+1]);mapped[key]=mapped[key]===undefined?value:`${mapped[key]}, ${value}`;}values=mapped;}
@@ -266,6 +294,22 @@ class RawResponse {
   for(const [key,value] of Object.entries(this.headers))for(const item of Array.isArray(value)?value:[value])head+=`${key}: ${item}\r\n`;
   this.socket.write(Buffer.concat([Buffer.from(`${head}\r\n`),wireBody]));this.chunks=[];this.size=0;this.finished=true;this.complete();return this;
  }
+ endGit(type: string, body: Buffer, requestId: string): void {
+  const cacheable = this.method !== 'HEAD' && this.keepAlive && type.endsWith('-advertisement');
+  const cached = cacheable ? gitAdvertisementFrames.get(body) : undefined;
+  if (cached) { this.endFrame(cached); return; }
+  const head = Buffer.from('HTTP/1.1 200 OK\r\ncontent-type: ' + type +
+    '\r\ncontent-length: ' + body.length + '\r\nx-github-request-id: ' + requestId +
+    '\r\ncache-control: no-cache\r\nconnection: ' + (this.keepAlive ? 'keep-alive' : 'close') + '\r\n\r\n');
+  const frame = this.method === 'HEAD' ? head : Buffer.concat([head, body]);
+  if (cacheable) gitAdvertisementFrames.set(body, frame);
+  this.endFrame(frame);
+ }
+ endFrame(frame: Buffer): void {
+  this.headersSent = this.finished = true;
+  this.socket.write(frame);
+  this.complete();
+ }
  destroy(error?:Error):this{if(!this.socket.destroyed)this.socket.destroy(error);this.finished=true;this.complete();return this;}
 }
 class BufferedRequest implements AsyncIterable<Buffer> {
@@ -276,18 +320,44 @@ class BufferedRequest implements AsyncIterable<Buffer> {
 
 export function createApp(): Server {
  initializeStore();
+ const token = process.env.MAKEFUN_SHOP_TOKEN;
+ authorization = token ? "Bearer " + token : undefined;
  const server=createServer({allowHalfOpen:true},socket=>{
+  const headerMemo: HeaderMemo = {};
+  let lastRead: { request: Buffer; response: ReadFrame } | undefined;
   socket.setNoDelay(true);socket.setTimeout(5000,()=>socket.end());let input=Buffer.alloc(0),pumping=false,continueSent=false,stopped=false,clientEnded=false,activeResponse:RawResponse|undefined;
   socket.on('data',chunk=>{input=input.length?Buffer.concat([input,chunk]):chunk;pump();});
   socket.on('end',()=>{clientEnded=true;if(!pumping)pump();});
   socket.on('error',()=>{stopped=true;});socket.on('close',()=>{stopped=true;activeResponse?.destroy();});
   async function pump(){
    if(pumping||stopped||socket.destroyed)return;pumping=true;
-   try{while(!stopped&&!socket.destroyed){const headerEnd=input.indexOf('\r\n\r\n');if(headerEnd<0){if(clientEnded){if(input.length)socket.end('HTTP/1.1 400 Bad Request\r\nConnection: close\r\nContent-Length: 0\r\n\r\n');else socket.end();stopped=true;}break;}let head:ReturnType<typeof parseHead>;let parsed:ReturnType<typeof parseRequestBody>;
-    try{head=parseHead(input,headerEnd);const expect=head.headers.expect;if(!continueSent&&expect){const expectsContinue=expect.toLowerCase().split(',').some(value=>value.trim()==='100-continue'),length=head.headers['content-length'],awaitsBody=head.headers['transfer-encoding']!==undefined||(length!==undefined&&length!=='0');if(expectsContinue&&awaitsBody){socket.write('HTTP/1.1 100 Continue\r\n\r\n');continueSent=true;}}parsed=parseRequestBody(input,head);}catch{socket.end('HTTP/1.1 400 Bad Request\r\nConnection: close\r\nContent-Length: 0\r\n\r\n');stopped=true;break;}
-    if(!parsed){if(clientEnded){socket.end('HTTP/1.1 400 Bad Request\r\nConnection: close\r\nContent-Length: 0\r\n\r\n');stopped=true;}break;}input=input.subarray(parsed.consumed);continueSent=false;
+   // A byte-for-byte repeat inherits the validated method, framing, and credentials.
+
+   try{while(!stopped&&!socket.destroyed){
+    if (lastRead && lastRead.response.version === lastRead.response.repo.version &&
+        input.length >= lastRead.request.length &&
+        input.compare(lastRead.request, 0, lastRead.request.length, 0, lastRead.request.length) === 0) {
+     input = input.subarray(lastRead.request.length);
+     socket.write(lastRead.response.frame);
+     continue;
+    }
+    const headerEnd=input.indexOf('\r\n\r\n');if(headerEnd<0){if(clientEnded){if(input.length)socket.end('HTTP/1.1 400 Bad Request\r\nConnection: close\r\nContent-Length: 0\r\n\r\n');else socket.end();stopped=true;}break;}let head:ReturnType<typeof parseHead>;let parsed:ReturnType<typeof parseRequestBody>;
+    try{head=parseHead(input,headerEnd,headerMemo);const expect=head.headers.expect;if(!continueSent&&expect){const expectsContinue=expect.toLowerCase().split(',').some(value=>value.trim()==='100-continue'),length=head.headers['content-length'],awaitsBody=head.headers['transfer-encoding']!==undefined||(length!==undefined&&length!=='0');if(expectsContinue&&awaitsBody){socket.write('HTTP/1.1 100 Continue\r\n\r\n');continueSent=true;}}parsed=parseRequestBody(input,head);}catch{socket.end('HTTP/1.1 400 Bad Request\r\nConnection: close\r\nContent-Length: 0\r\n\r\n');stopped=true;break;}
+    if(!parsed){if(clientEnded){socket.end('HTTP/1.1 400 Bad Request\r\nConnection: close\r\nContent-Length: 0\r\n\r\n');stopped=true;}break;}const request = input;
+    input=input.subarray(parsed.consumed);continueSent=false;
     const connection=head.headers.connection?.toLowerCase()??'',keepAlive=head.version==='HTTP/1.1'?connection!=='close':connection.split(',').some(value=>value.trim()==='keep-alive');
-    const headers:Record<string,any>={...head.headers};const body=head.method==='GET'||head.method==='HEAD'?Buffer.alloc(0):parsed.body;
+    if (keepAlive && head.method === 'GET' && viewerFor(head.headers.authorization)) {
+     const cached = readFrames.get(head.target);
+     if (cached && cached.version === cached.repo.version) {
+      if (parsed.consumed === head.bodyOffset && head.bodyOffset <= 4096 && cached.frame.length <= 4096 &&
+          head.headers.expect === undefined && !head.headers['transfer-encoding']) {
+       lastRead = { request: Buffer.from(request.subarray(0, head.bodyOffset)), response: cached };
+      }
+      socket.write(cached.frame);
+      continue;
+     }
+    }
+    const headers=head.headers;const body=head.method==='GET'||head.method==='HEAD'?EMPTY_BODY:parsed.body;
     const req=new BufferedRequest(head.target,head.method,headers,body) as unknown as IncomingMessage;
     const res=new RawResponse(socket,head.method,keepAlive);activeResponse=res;
     try{dispatch(req,res);}catch{if(!res.headersSent)res.writeHead(500,{'content-type':'application/json; charset=utf-8'}).end('{"message":"Internal Server Error"}\n');else res.destroy();}
@@ -301,12 +371,12 @@ export function createApp(): Server {
    try {
     const rawPath=req.url??'';
     const fastIssue=(req.method??'GET')==='GET'&&rawPath.startsWith('/api/v3/repos/')?/^\/api\/v3\/repos\/([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)\/issues\/([0-9]+)(?:\?|$)/.exec(rawPath):null;
-    if(fastIssue){const token=process.env.MAKEFUN_SHOP_TOKEN??'';if(!token||req.headers.authorization!==`Bearer ${token}`){sendJson(res,401,{message:'Bad credentials'});return;}const owner=fastIssue[1]!,meta=repository(owner,fastIssue[2]!);if(owner.toLowerCase()!==VIEWER||!meta){notFound(res);return;}const n=Number(fastIssue[3]),issue=getIssue(meta,n);if(!Number.isInteger(n)||!issue){notFound(res);return;}sendJson(res,200,issue,undefined,issueJsonCache);return;}
+    if(fastIssue){if(!viewerFor(req.headers.authorization)){sendJson(res,401,{message:'Bad credentials'});return;}const owner=fastIssue[1]!,meta=repository(owner,fastIssue[2]!);if(owner.toLowerCase()!==VIEWER||!meta){notFound(res);return;}const n=Number(fastIssue[3]),issue=getIssue(meta,n);if(!Number.isInteger(n)||!issue){notFound(res);return;}sendRead(req,res,meta,issue);return;}
     const path=pathOf(req),method=req.method??'GET';
     const gitMatch=/^\/([^/]+)\/([^/]+)\.git\/(info\/refs|git-upload-pack|git-receive-pack)$/.exec(path);
     if(gitMatch){const owner=decodeURIComponent(gitMatch[1]!),repo=decodeURIComponent(gitMatch[2]!),endpoint=gitMatch[3]!;const action=endpoint==='info/refs'?'info':endpoint==='git-upload-pack'?'upload':'receive';let service='';if(endpoint==='git-receive-pack')service='git-receive-pack';else if(endpoint==='git-upload-pack')service='git-upload-pack';else{const raw=req.url??'',q=raw.indexOf('?');if(q>=0){const query=raw.slice(q+1);service=query==='service=git-receive-pack'?'git-receive-pack':query==='service=git-upload-pack'?'git-upload-pack':new URLSearchParams(raw.split('?',2)[1]).get('service')??'';}}void handleGit(req,res,owner,repo,service,action,new RepoStore(owner,repo)).catch(()=>fail(res));return;}
     if(method==='GET'&&path==='/healthz'){sendJson(res,200,{ok:true});return;}
-    if(path==='/mcp'&&method==='POST'){void handleMcp(req,res,{token:process.env.MAKEFUN_SHOP_TOKEN??'',viewer:VIEWER,repo:repository,createRepo:(name)=>{const meta:RepoMeta={id:repositories.size+1,owner:VIEWER,name,description:'',private:true,default_branch:'main',labels:new Map(),issues:new Map(),pulls:new Map()};new RepoStore(VIEWER,name).create();repositories.set(keyOf(VIEWER,name),meta);return repoJson(meta);},nextIssue:()=>++issueNumber,merge:mergePullForGraphQL}).catch(()=>fail(res));return;}
+    if(path==='/mcp'&&method==='POST'){void handleMcp(req,res,{token:process.env.MAKEFUN_SHOP_TOKEN??'',viewer:VIEWER,repo:repository,createRepo:(name)=>{const meta:RepoMeta={id:repositories.size+1,version:0,owner:VIEWER,name,description:'',private:true,default_branch:'main',labels:new Map(),issues:new Map(),pulls:new Map()};new RepoStore(VIEWER,name).create(() => ++meta.version);const key=keyOf(VIEWER,name),previous=repositories.get(key);if(previous)previous.version++;repositories.set(key,meta);return repoJson(meta);},nextIssue:()=>++issueNumber,merge:mergePullForGraphQL}).catch(()=>fail(res));return;}
     if(path==='/api/graphql'){void graphql(req,res).catch(()=>{if(!res.headersSent)sendJson(res,500,{message:'Internal Server Error'});});return;}
     if(path==='/api/v3'||path.startsWith('/api/v3/')){void rest(req,res).catch(()=>{if(!res.headersSent)sendJson(res,500,{message:'Internal Server Error'});});return;}
     notFound(res);

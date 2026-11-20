@@ -1,6 +1,6 @@
 import type { IncomingMessage, ServerResponse } from 'node:http';
 
-type Repo = { id: number; owner: string; name: string; description: string; private: boolean; default_branch: string; issues: Map<number, Record<string, any>>; pulls: Map<number, Record<string, any>> };
+type Repo = { version: number; id: number; owner: string; name: string; description: string; private: boolean; default_branch: string; issues: Map<number, Record<string, any>>; pulls: Map<number, Record<string, any>> };
 type Ops = { token: string; viewer: string; repo(owner: string, name: string): Repo | undefined; createRepo(name: string): unknown; nextIssue(): number; merge(meta: Repo, pull: Record<string, any>): boolean };
 const tools = [
   { name: 'create_repo', description: 'Create a repository.', inputSchema: { type: 'object', properties: { name: { type: 'string' } }, required: ['name'] } },
@@ -32,7 +32,7 @@ export async function handleMcp(req: IncomingMessage, res: ServerResponse, ops: 
         if (name === 'create_repo') value = ops.createRepo(a.name);
         else { const meta = ops.repo(a.owner, a.repo); if (!meta) value = { message: 'Not Found' };
           else if (name === 'get_repo') value = { id: meta.id, name: meta.name, full_name: `${meta.owner}/${meta.name}`, owner: { login: meta.owner }, private: meta.private, default_branch: meta.default_branch, description: meta.description };
-          else if (name === 'create_issue') { const number=ops.nextIssue(); value = { id:number, number, title: a.title, body: a.body ?? '', state: 'open', labels: [], created_at: new Date().toISOString() }; meta.issues.set(value.number, value); }
+          else if (name === 'create_issue') { const number=ops.nextIssue(); value = { id:number, number, title: a.title, body: a.body ?? '', state: 'open', labels: [], created_at: new Date().toISOString() }; meta.issues.set(value.number, value); meta.version++; }
           else if (name === 'list_issues') value = [...meta.issues.values()].filter(i => !a.state || a.state === 'all' || i.state === a.state);
           else if (name === 'create_pull_request') { value = { number: meta.pulls.size + 1, state: 'open', title: a.title, head: { ref: a.head }, base: { ref: a.base }, merged: false }; meta.pulls.set(value.number, value); }
           else { const pull = meta.pulls.get(Number(a.pull_number)); if (!pull) value = { message: 'Not Found' }; else { ops.merge(meta, pull); value = pull; } }

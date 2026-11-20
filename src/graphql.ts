@@ -7,6 +7,7 @@ export interface GraphQLContext {
   resolveBranch(repo: Any, ref: string): string | undefined;
   pullFiles(repo: Any, pull: Any): string[];
   mergePull(repo: Any, pull: Any): boolean;
+  invalidateIssueReads(repo: Any): void;
   nextIssueNumber(): number;
   nextCommentId(): number;
 }
@@ -155,14 +156,14 @@ function resolveField(parent: Any, parentType: string, field: Field, vars: Any, 
     const input=args.input??{};
     if(field.name==='createIssue'){
       const r=[...ctx.repositories.values()].find(x=>repoId(x)===input.repositoryId);if(!r)return null;
-      const issue={number:ctx.nextIssueNumber(),title:String(input.title??''),body:String(input.body??''),state:'open',created_at:new Date().toISOString()};r.issues.set(issue.number,issue);
+      const issue={number:ctx.nextIssueNumber(),title:String(input.title??''),body:String(input.body??''),state:'open',created_at:new Date().toISOString()};r.issues.set(issue.number,issue);ctx.invalidateIssueReads(r);
       return {__kind:'MutationPayload',type:'CreateIssuePayload',issue:{__kind:'Issue',repo:r,issue}};
     }
     if(field.name==='closeIssue'){
-      for(const r of ctx.repositories.values())for(const i of r.issues.values())if(issueId(r,i.number)===input.issueId){i.state='closed';return {__kind:'MutationPayload',type:'CloseIssuePayload',issue:{__kind:'Issue',repo:r,issue:i}};}return null;
+      for(const r of ctx.repositories.values())for(const i of r.issues.values())if(issueId(r,i.number)===input.issueId){i.state='closed';ctx.invalidateIssueReads(r);return {__kind:'MutationPayload',type:'CloseIssuePayload',issue:{__kind:'Issue',repo:r,issue:i}};}return null;
     }
     if(field.name==='addComment'){
-      for(const r of ctx.repositories.values())for(const i of r.issues.values())if(issueId(r,i.number)===input.subjectId){const c={id:ctx.nextCommentId(),body:String(input.body??'')};(i.comments??=[]).push(c);return {__kind:'MutationPayload',type:'AddCommentPayload',commentEdge:{__kind:'CommentEdge',node:{__kind:'Comment',...c}}};}return null;
+      for(const r of ctx.repositories.values())for(const i of r.issues.values())if(issueId(r,i.number)===input.subjectId){const c={id:ctx.nextCommentId(),body:String(input.body??'')};(i.comments??=[]).push(c);ctx.invalidateIssueReads(r);return {__kind:'MutationPayload',type:'AddCommentPayload',commentEdge:{__kind:'CommentEdge',node:{__kind:'Comment',...c}}};}return null;
     }
     if(field.name==='createPullRequest'){
       const r=[...ctx.repositories.values()].find(x=>repoId(x)===input.repositoryId);if(!r)return null;
