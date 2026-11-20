@@ -20,6 +20,7 @@ let issueNumber = 0, commentId = 0;
 type ReadFrame = { repo: RepoMeta; version: number; frame: Buffer };
 const gitAdvertisementFrames = new WeakMap<Buffer, Buffer>();
 const readFrames = new ByteCache<string, ReadFrame>(8 * 1024 * 1024);
+export const readFrameStats = { repeat: 0, parsed: 0, built: 0 };
 let authorization: string | undefined;
 function viewerFor(header: unknown) { return authorization && header === authorization ? VIEWER : undefined; }
 
@@ -32,6 +33,7 @@ function jsonFrame(status: number, text: string, keepAlive: boolean): Buffer {
 }
 
 function sendRead(req: IncomingMessage, res: ServerResponse, repo: RepoMeta, body: unknown) {
+  readFrameStats.built++;
   const raw = res as unknown as RawResponse;
   const target = req.url!;
   const frame = jsonFrame(200, JSON.stringify(body) + '\n', raw.keepAlive);
@@ -338,6 +340,7 @@ export function createApp(): Server {
         input.length >= lastRead.request.length &&
         input.compare(lastRead.request, 0, lastRead.request.length, 0, lastRead.request.length) === 0) {
      input = input.subarray(lastRead.request.length);
+     readFrameStats.repeat++;
      socket.write(lastRead.response.frame);
      continue;
     }
@@ -353,6 +356,7 @@ export function createApp(): Server {
           head.headers.expect === undefined && !head.headers['transfer-encoding']) {
        lastRead = { request: Buffer.from(request.subarray(0, head.bodyOffset)), response: cached };
       }
+      readFrameStats.parsed++;
       socket.write(cached.frame);
       continue;
      }
